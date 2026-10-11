@@ -1,0 +1,21 @@
+{
+    "startup_name": "AI Study Assistant",
+    "idea_description": "An AI chatbot using Retrieval-Augmented Generation (RAG) to answer questions from uploaded textbooks and syllabus documents.",
+    "target_customers": [
+        "Students",
+        "Teachers"
+    ],
+    "industry": "Education",
+    "problem_statement": "Students and teachers need an easy way to find accurate answers from textbooks and syllabus materials.",
+    "estimated_budget": {
+        "amount": 20000,
+        "currency": "INR"
+    },
+    "additional_information": {
+        "core_technology": "LLM and RAG",
+        "document_sources": [
+            "Textbooks",
+            "Syllabus documents"
+        ]
+    }
+}
