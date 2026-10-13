@@ -1,16 +1,52 @@
-# React + Vite
+# AI Startup Idea Validator
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The AI Startup Idea Validator helps entrepreneurs evaluate startup ideas before making financial commitments. It aims to provide insights into market demand, target customers, competitors, financial feasibility, and business risks.
 
-Currently, two official plugins are available:
+## React Startup Idea Submission UI
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+This module collects startup idea details through a responsive React-based form and generates structured JSON for further analysis.
 
-## React Compiler
+### Features
+- Responsive startup idea submission form
+- Dark and light theme support
+- Theme preference saved using localStorage
+- Required-field validation
+- Structured JSON preview
+- Copy JSON functionality
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### Technologies Used
+- React
+- Vite
+- JavaScript
+- CSS
+- JSON
 
-## Expanding the Oxlint configuration
+### Current Implementation Status
+The frontend generates structured JSON using JavaScript. Actual LLM API integration, backend processing, and server-side JSON schema validation are planned enhancements.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+## Project Structure
+
+- `agile/` – Agile templates and testing documents
+- `docs/` – Project documentation and task descriptions
+- `src/` – Application source code
+- `public/` – Public assets
+
+## Getting Started
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the development server:
+
+```bash
+npm run dev
+```
+
+Build the application:
+
+```bash
+npm run build
+```
