@@ -46,3 +46,29 @@ flowchart TD
 
 Note: The diagram represents the planned initial workflow.
 Actual integration and testing will confirm the final implementation.
+
+
+
+
+
+
+
+
+
+## Agent Responsibilities
+
+| Agent / Component | Responsibility | Input | Output |
+|---|---|---|---|
+| Idea Extraction Agent | Uses an LLM to structure the startup idea | Raw startup idea | Structured idea dictionary |
+| Web Search Agent | Searches market demand and competitors using Tavily | Startup idea | Market and competitor search results |
+| Market Analysis Agent | Analyzes market trends and demand | Structured idea and search results | Market analysis |
+| Competitor Analysis Agent | Identifies competitors and compares offerings | Structured idea and search results | Competitor analysis |
+| SWOT and Risk Agent | Identifies strengths, weaknesses, opportunities, and threats | Idea and research findings | SWOT and risk assessment |
+| MVP Recommendation Agent | Suggests essential features for the first product version | Idea and research findings | MVP recommendations |
+| Report Generation Agent | Combines analysis into a validation report | Available analysis outputs | Final report |
+| Orchestrator | Coordinates modules, passes data, and handles errors | Startup idea | Combined workflow result |
+
+## Current Milestone Scope
+
+The initial integration connects the Idea Extraction Agent and Web Search Agent through the orchestrator. The remaining analysis agents are planned components and can be implemented in later stages.
+
