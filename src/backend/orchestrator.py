@@ -43,3 +43,11 @@ def orchestrate_startup_validation(startup_idea: str) -> dict:
             "success": False,
             "error": str(error)
         }
+
+if __name__ == "__main__":
+    idea = input("Enter your startup idea: ")
+
+    result = orchestrate_startup_validation(idea)
+
+    print("\n--- Startup Validation Result ---")
+    print(result)
