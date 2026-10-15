@@ -1,5 +1,4 @@
 
-%%writefile /content/AI-Startup-Idea-Validator/orchestrator.py
 import os
 from tavily import TavilyClient
 from idea_extractor import extract_idea
@@ -26,7 +25,7 @@ def orchestrate_startup_validation(startup_idea: str) -> dict:
                 "Idea extraction must return a dictionary."
             )
 
-        # Task 3: Create client and retrieve research
+        # Task 3: Retrieve market and competitor research
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
             raise ValueError("TAVILY_API_KEY is missing.")
@@ -50,8 +49,3 @@ def orchestrate_startup_validation(startup_idea: str) -> dict:
             "success": False,
             "error": str(error)
         }
-
-
-if __name__ == "__main__":
-    idea = input("Enter your startup idea: ")
-    print(orchestrate_startup_validation(idea))
