@@ -22,3 +22,15 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets, Python environments, and test artifacts
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+backend/venv/
+__pycache__/
+.pytest_cache/
+backend/pytest-cache-files-*/
+*.py[cod]

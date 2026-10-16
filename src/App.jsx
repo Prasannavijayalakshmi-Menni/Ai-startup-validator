@@ -2,6 +2,8 @@
 import { useState } from "react";
 import "./App.css";
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
+
 function App() {
   const [theme, setTheme] = useState(
     localStorage.getItem("asv-theme") || "dark"
@@ -13,11 +15,14 @@ function App() {
     industry: "",
     problem: "",
     budget: "",
+    budgetCurrency: "INR",
     additionalInfo: "",
   });
 
   const [errors, setErrors] = useState({});
   const [submittedData, setSubmittedData] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [apiMessage, setApiMessage] = useState("");
 
   function changeTheme() {
     const nextTheme = theme === "dark" ? "light" : "dark";
@@ -27,6 +32,7 @@ function App() {
 
   function handleChange(event) {
     const { name, value } = event.target;
+    setApiMessage("");
 
     setFormData((previous) => ({
       ...previous,
@@ -39,8 +45,9 @@ function App() {
     }));
   }
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
+    if (isSubmitting) return;
 
     const newErrors = {};
 
@@ -86,12 +93,45 @@ function App() {
       problem_statement: formData.problem.trim(),
       estimated_budget: {
         amount: Number(formData.budget),
-        currency: "INR",
+        currency: formData.budgetCurrency,
       },
       additional_information: formData.additionalInfo.trim() || null,
     };
 
-    setSubmittedData(structuredData);
+    setSubmittedData(null);
+    setApiMessage("");
+    setIsSubmitting(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ideas/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idea_description: structuredData.idea_description,
+          target_customers: formData.customers.trim(),
+          industry: structuredData.industry,
+          problem_statement: structuredData.problem_statement,
+          estimated_budget: structuredData.estimated_budget.amount,
+          estimated_budget_currency: structuredData.estimated_budget.currency,
+          additional_information: structuredData.additional_information,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = Array.isArray(result.detail)
+          ? result.detail.map((item) => `${item.loc?.slice(-1)[0] || "field"}: ${item.msg}`).join("; ")
+          : result.detail || result.message || `Request failed (HTTP ${response.status}).`;
+        throw new Error(detail);
+      }
+      setSubmittedData(result);
+      setApiMessage("Idea analyzed successfully.");
+    } catch (error) {
+      const message = error instanceof TypeError
+        ? "Could not connect to the backend. Confirm it is running and VITE_API_BASE_URL is correct."
+        : error.message || "Unexpected backend error.";
+      setApiMessage(`Submission failed: ${message}`);
+    } finally {
+      setIsSubmitting(false);
+    }
   }
 
   return (
@@ -254,9 +294,18 @@ function App() {
               </div>
 
               <div className="field">
-                <label htmlFor="budget">Estimated budget (₹) <b>*</b></label>
+                <label htmlFor="budget">Estimated budget <b>*</b></label>
                 <div className="input-with-symbol">
-                  <span>₹</span>
+                  <select
+                    id="budgetCurrency"
+                    name="budgetCurrency"
+                    aria-label="Budget currency"
+                    value={formData.budgetCurrency}
+                    onChange={handleChange}
+                  >
+                    <option value="INR">₹ INR</option>
+                    <option value="USD">$ USD</option>
+                  </select>
                   <input
                     id="budget"
                     name="budget"
@@ -288,10 +337,11 @@ function App() {
 
             <div className="form-actions">
               <span><b>*</b> Required fields</span>
-              <button className="submit-button" type="submit">
-                <span>✧</span> Prepare My Idea <span>→</span>
+              <button className="submit-button" type="submit" disabled={isSubmitting}>
+                <span>✧</span> {isSubmitting ? "Analyzing?" : "Prepare My Idea"} <span>→</span>
               </button>
             </div>
+            {apiMessage && <p className={apiMessage.startsWith("Submission failed:") ? "error" : "success-message"} role="status">{apiMessage}</p>}
           </form>
         </section>
 
@@ -320,7 +370,7 @@ function App() {
               <div className="section-icon">{"{ }"}</div>
               <div>
                 <h2>Structured idea output</h2>
-                <p>Validated form data, formatted as JSON.</p>
+                <p>Backend analysis response, formatted as JSON.</p>
               </div>
             </div>
             <pre>{JSON.stringify(submittedData, null, 2)}</pre>
@@ -341,7 +391,7 @@ function App() {
               Copy JSON
             </button>
             <p className="output-note">
-              This is frontend-generated JSON, not an actual LLM response.
+              Research snippets are provider supplied and not independently verified. Review each source URL before relying on a claim or figure.
             </p>
           </section>
         )}

@@ -521,21 +521,26 @@
   margin-top: 6px;
 }
 
-.input-with-symbol {
-  position: relative;
+.success-message {
+  color: #22c55e;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 14px 0 0;
 }
 
-.input-with-symbol>span {
-  position: absolute;
-  left: 14px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--accent-light);
-  font-weight: 700;
+.input-with-symbol {
+  display: flex;
+  gap: 8px;
+}
+
+.input-with-symbol select {
+  width: auto;
+  flex-shrink: 0;
 }
 
 .input-with-symbol input {
-  padding-left: 35px;
+  flex: 1;
+  width: 1px;
 }
 
 .form-actions {
@@ -572,6 +577,12 @@
 .submit-button:hover {
   transform: translateY(-2px);
   box-shadow: 0 12px 27px rgba(124, 58, 237, 0.3);
+}
+
+.submit-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+  transform: none;
 }
 
 .submit-button:focus-visible,
