@@ -1,6 +1,6 @@
 # AI Startup Idea Validator
 
-A React/Vite submission workspace backed by FastAPI. The analysis endpoint uses a configurable OpenAI-compatible chat completions API to extract a validated startup concept, then Tavily to retrieve market, competitor, and trend sources. The existing manual submission endpoint remains available.
+A React/Vite submission workspace backed by FastAPI. The analysis workflow extracts a validated startup concept with the configured OpenAI-compatible provider, searches Tavily, and runs market opportunity analysis with the team's Google Gen AI SDK and Gemini model. Competitor and SWOT/risk analysis continue using the configured OpenAI-compatible provider. The existing manual submission endpoint remains available.
 
 ## Architecture
 
@@ -12,7 +12,10 @@ flowchart LR
   E -->|OpenAI-compatible API, LLM_API_KEY| LLM[Configured LLM provider]
   E -->|Pydantic validated idea| R[Market research agent]
   R -->|TAVILY_API_KEY| T[Tavily search]
-  R --> O
+  R --> M[Market opportunity and segmentation agent]
+  M -->|GEMINI_API_KEY, google-genai| G[Gemini gemini-3.8-flash]
+  G --> M
+  M --> O
   O --> C[Competitor discovery and comparison agent]
   C -->|Groq structured analysis grounded in Tavily sources| LLM
   C --> O
@@ -35,7 +38,7 @@ Copy-Item .env.example .env
 uvicorn main:app --reload --port 8001
 ```
 
-Set `LLM_API_KEY` and `TAVILY_API_KEY` in `backend/.env` before calling the analysis endpoint. `LLM_MODEL` defaults to `openai/gpt-oss-20b`; `LLM_BASE_URL` defaults to `https://api.groq.com/openai/v1` and can point to a compatible provider. `FRONTEND_ORIGIN` is a comma-separated allowlist. The analysis endpoint reports missing credentials explicitly and rejects invalid structured output.
+Set `LLM_API_KEY`, `GEMINI_API_KEY`, and `TAVILY_API_KEY` in `backend/.env` before calling the analysis endpoint. The market opportunity/customer segmentation agent uses `gemini-3.8-flash` through the official `google-genai` SDK. Idea extraction, competitor analysis, and SWOT/risk use the OpenAI-compatible provider: `LLM_MODEL` defaults to `openai/gpt-oss-20b`, and `LLM_BASE_URL` defaults to `https://api.groq.com/openai/v1`. `FRONTEND_ORIGIN` is a comma-separated allowlist. The analysis endpoint reports missing credentials explicitly and rejects invalid structured output.
 
 ### Frontend
 

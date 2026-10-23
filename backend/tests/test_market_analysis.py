@@ -1,20 +1,23 @@
+import asyncio
 import json
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from pydantic import ValidationError
+from google import genai
+from google.genai import types
 
-from app.schemas import (
-    MarketOpportunityAnalysis,
-    Source,
-    StructuredIdea,
-)
+from app.schemas import MarketOpportunityAnalysis, Source, StructuredIdea
 from app.services.idea_extraction import ServiceError
 from app.services.market_analysis import (
+    GEMINI_MODEL,
     MarketOpportunityAnalysisAgent,
-    _market_response_format,
+    _gemini_response_schema,
 )
+import app.services.market_analysis as market_analysis_module
 
 SOURCE_URL = "https://research.example/market"
 IDEA = StructuredIdea(
@@ -69,68 +72,205 @@ def valid_result():
             }
         ],
         "challenges": [
-            {
-                "claim": "Unknown",
-                "classification": "unknown",
-                "evidence": [],
-            }
+            {"claim": "Unknown", "classification": "unknown", "evidence": []}
         ],
     }
 
 
+class FakeGeminiClient:
+    def __init__(self, response=None, error=None, captured=None):
+        self.captured = captured if captured is not None else {}
+        self.response = response
+        self.error = error
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self.generate_content))
+        self.aio.aclose = AsyncMock()
+        self.close = lambda: None
+
+    async def generate_content(self, **kwargs):
+        self.captured["request"] = kwargs
+        if self.error:
+            raise self.error
+        return SimpleNamespace(text=self.response)
+
+
 @pytest.fixture(autouse=True)
 def configured_provider(monkeypatch):
-    monkeypatch.setenv("LLM_API_KEY", "mock-market-key")
-    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
 
 
-def transport_with(payload, status=200):
-    return httpx.MockTransport(
-        lambda request: httpx.Response(status, json=payload, request=request)
-    )
+def make_agent(response=None, error=None, captured=None):
+    captured = captured if captured is not None else {}
+    clients = []
 
+    def factory(api_key):
+        captured["api_key_received"] = api_key
+        client = FakeGeminiClient(response=response, error=error, captured=captured)
+        clients.append(client)
+        return client
 
-def completion(content):
-    return {"choices": [{"message": {"content": content}}]}
+    return MarketOpportunityAnalysisAgent(client_factory=factory), captured, clients
 
 
 @pytest.mark.asyncio
-async def test_market_analysis_uses_json_object_mode_and_validates_result_locally():
-    result = valid_result()
-    seen = {}
+async def test_gemini_success_uses_teammate_model_and_validates_typed_response():
+    captured = {}
+    agent, captured, clients = make_agent(json.dumps(valid_result()), captured=captured)
 
-    def handler(request):
-        seen["url"] = str(request.url)
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=completion(json.dumps(result)), request=request)
-
-    analysis = await MarketOpportunityAnalysisAgent(
-        transport=httpx.MockTransport(handler)
-    ).analyze(IDEA, RESEARCH)
+    analysis = await agent.analyze(IDEA, RESEARCH)
 
     assert isinstance(analysis, MarketOpportunityAnalysis)
     assert analysis.demand_assessment.evidence == [SOURCE_URL]
     assert analysis.customer_segments[0].needs[0].classification == "hypothesis"
     assert analysis.challenges[0].claim == "Unknown"
-    assert seen["url"] == "https://api.groq.com/openai/v1/chat/completions"
-    assert seen["body"]["model"] == "openai/gpt-oss-20b"
-    assert seen["body"]["temperature"] == 0
-    assert seen["body"]["include_reasoning"] is False
-    assert "reasoning_format" not in seen["body"]
-    assert seen["body"]["response_format"] == _market_response_format()
-    assert seen["body"]["response_format"] == {"type": "json_object"}
-    assert seen["body"]["messages"][0]["role"] == "system"
-    prompt = seen["body"]["messages"][1]["content"]
+    assert captured["api_key_received"] == "mock-gemini-key"
+    request = captured["request"]
+    assert request["model"] == GEMINI_MODEL == "gemini-3.8-flash"
+    assert request["config"]["response_mime_type"] == "application/json"
+    schema = request["config"]["response_schema"]
+    assert schema["title"] == "MarketOpportunityAnalysis"
+    assert "demand_assessment" in schema["required"]
+    assert "additionalProperties" not in json.dumps(schema)
+    assert request["config"]["system_instruction"]
+    prompt = request["contents"]
+    assert "one valid JSON object only" in prompt
     assert "Do not invent statistics" in prompt
     assert "Do not include or reinterpret the submitted budget" in prompt
     assert "estimated_budget" not in prompt
     assert "50000" not in prompt
-    assert "valid JSON object only" in prompt
+    assert SOURCE_URL in prompt
+    clients[0].aio.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_market_request_metadata_is_safe_and_competitor_sources_are_not_duplicated(caplog):
+async def test_gemini_sdk_serializes_supported_response_schema_without_extra_properties():
+    serialized = {}
+
+    def handler(request):
+        serialized["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": json.dumps(valid_result())}],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    client = genai.Client(
+        api_key="mock-only-key",
+        http_options=types.HttpOptions(
+            async_client_args={
+                "transport": httpx.MockTransport(handler),
+                "trust_env": False,
+            }
+        ),
+    )
+    agent = MarketOpportunityAnalysisAgent(client_factory=lambda _: client)
+
+    try:
+        analysis = await agent.analyze(IDEA, RESEARCH)
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+    assert isinstance(analysis, MarketOpportunityAnalysis)
+    request_schema = serialized["body"]["generationConfig"]["responseSchema"]
+    assert request_schema["type"] == "OBJECT"
+    assert "demand_assessment" in request_schema["required"]
+    assert "additionalProperties" not in json.dumps(request_schema)
+    assert "additional_properties" not in json.dumps(request_schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {key: value for key, value in valid_result().items() if key != "demand_assessment"},
+        {**valid_result(), "unexpected": True},
+        {**valid_result(), "customer_segments": "not an array"},
+        {**valid_result(), "opportunities": [{"claim": "missing required classification"}]},
+    ],
+)
+async def test_gemini_invalid_schema_response_is_rejected_without_fabrication(invalid):
+    agent, _, _ = make_agent(json.dumps(invalid))
+
+    with pytest.raises(ServiceError, match="required schema"):
+        await agent.analyze(IDEA, RESEARCH)
+
+
+@pytest.mark.asyncio
+async def test_gemini_unsupported_citation_is_rejected():
+    invalid = valid_result()
+    invalid["demand_assessment"]["evidence"] = ["https://outside.example/claim"]
+    agent, _, _ = make_agent(json.dumps(invalid))
+
+    with pytest.raises(ServiceError, match="unsupported source URL"):
+        await agent.analyze(IDEA, RESEARCH)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,expected,status_code",
+    [
+        (400, "HTTP 400", 502),
+        (401, "credential", 503),
+        (403, "denied", 503),
+        (429, "rate or quota", 503),
+        (500, "provider request failed", 502),
+    ],
+)
+async def test_gemini_api_errors_are_sanitized_and_mapped(status, expected, status_code, caplog):
+    error = RuntimeError("sensitive provider message mock-gemini-key")
+    error.code = status
+    error.message = "sensitive provider message mock-gemini-key"
+    agent, _, _ = make_agent(error=error)
+    caplog.set_level(logging.WARNING, logger="app.services.market_analysis")
+
+    with pytest.raises(ServiceError, match=expected) as raised:
+        await agent.analyze(IDEA, RESEARCH)
+
+    assert raised.value.status_code == status_code
+    assert "mock-gemini-key" not in caplog.text
+    assert "sensitive provider message" in caplog.text
+    assert f"code={status}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_gemini_error_diagnostic_redacts_credentials_research_and_logs_request_id(caplog):
+    error = RuntimeError("provider error")
+    error.code = 400
+    error.status = "INVALID_ARGUMENT"
+    error.message = (
+        f"Invalid response schema for {SOURCE_URL}; "
+        f"{RESEARCH['market_information'][0].content}; "
+        "api_key=mock-gemini-key Bearer mock-gemini-key"
+    )
+    error.response = SimpleNamespace(
+        headers={"x-goog-request-id": "gemini-test-request-123"}
+    )
+    agent, _, _ = make_agent(error=error)
+    caplog.set_level(logging.WARNING, logger="app.services.market_analysis")
+
+    with pytest.raises(ServiceError, match="Invalid response schema") as raised:
+        await agent.analyze(IDEA, RESEARCH)
+
+    assert "gemini-test-request-123" in caplog.text
+    assert "INVALID_ARGUMENT" in caplog.text
+    assert "mock-gemini-key" not in caplog.text
+    assert SOURCE_URL not in caplog.text
+    assert RESEARCH["market_information"][0].content not in caplog.text
+    assert "[REDACTED]" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_prompt_excludes_competitor_sources_and_request_logs_only_safe_metadata(caplog):
     competitor_only_text = "COMPETITOR_ONLY_TEXT_MUST_NOT_ENTER_MARKET_PROMPT"
     research = {
         **RESEARCH,
@@ -142,20 +282,13 @@ async def test_market_request_metadata_is_safe_and_competitor_sources_are_not_du
             )
         ],
     }
-    seen = {}
-
-    def handler(request):
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=completion(json.dumps(valid_result())), request=request)
-
+    agent, captured, _ = make_agent(json.dumps(valid_result()))
     caplog.set_level(logging.INFO, logger="app.services.market_analysis")
-    await MarketOpportunityAnalysisAgent(
-        transport=httpx.MockTransport(handler)
-    ).analyze(IDEA, research)
 
-    prompt = seen["body"]["messages"][1]["content"]
-    assert competitor_only_text not in prompt
-    assert "market_information" not in prompt
+    await agent.analyze(IDEA, research)
+
+    assert competitor_only_text not in captured["request"]["contents"]
+    assert "market_information" not in captured["request"]["contents"]
     assert "source_count=1" in caplog.text
     assert "source_content_chars=" in caplog.text
     assert "system_prompt_chars=" in caplog.text
@@ -167,91 +300,12 @@ async def test_market_request_metadata_is_safe_and_competitor_sources_are_not_du
 
 
 @pytest.mark.asyncio
-async def test_provider_400_logs_redacted_metadata_without_generation_or_prompt(caplog):
-    generated_content = "SENSITIVE_GENERATED_CONTENT"
-    provider_message = (
-        f"JSON validation failed for {RESEARCH['market_information'][0].content}; "
-        "api_key=mock-market-key Bearer mock-market-key"
-    )
-
-    def handler(request):
-        return httpx.Response(
-            400,
-            json={
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "json_validate_failed",
-                    "message": provider_message,
-                    "failed_generation": generated_content,
-                },
-                "x_groq": {"id": "req_body_456"},
-            },
-            headers={
-                "x-groq-id": "req_header_123",
-                "x-ratelimit-reset-tokens": "1.5s",
-                "authorization": "Bearer response-header-secret",
-                "x-secret": "must-not-be-logged",
-            },
-            request=request,
-        )
-
-    caplog.set_level(logging.WARNING, logger="app.services.market_analysis")
-    with pytest.raises(ServiceError, match="HTTP 400"):
-        await MarketOpportunityAnalysisAgent(
-            transport=httpx.MockTransport(handler)
-        ).analyze(IDEA, RESEARCH)
-
-    assert "status=400" in caplog.text
-    assert "type=invalid_request_error" in caplog.text
-    assert "code=json_validate_failed" in caplog.text
-    assert "failed_generation_present=True" in caplog.text
-    assert f"failed_generation_chars={len(generated_content)}" in caplog.text
-    assert "req_header_123" in caplog.text
-    assert "req_body_456" in caplog.text
-    assert "x-ratelimit-reset-tokens" in caplog.text
-    assert "mock-market-key" not in caplog.text
-    assert "response-header-secret" not in caplog.text
-    assert "must-not-be-logged" not in caplog.text
-    assert generated_content not in caplog.text
-    assert RESEARCH["market_information"][0].content not in caplog.text
-    assert SOURCE_URL not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_previous_groq_json_validation_error_is_not_retried():
-    requests = []
-
-    def handler(request):
-        requests.append(json.loads(request.content))
-        return httpx.Response(
-            400,
-            json={
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "json_validate_failed",
-                    "message": "Failed to validate JSON.",
-                    "failed_generation": "",
-                }
-            },
-            request=request,
-        )
-
-    with pytest.raises(ServiceError, match="HTTP 400"):
-        await MarketOpportunityAnalysisAgent(
-            transport=httpx.MockTransport(handler)
-        ).analyze(IDEA, RESEARCH)
-
-    assert len(requests) == 1
-    assert requests[0]["response_format"] == {"type": "json_object"}
-
-
-@pytest.mark.asyncio
-async def test_competitor_only_research_returns_unknown_without_provider_call():
+async def test_missing_research_returns_unknown_without_gemini_call(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     agent = MarketOpportunityAnalysisAgent(
-        transport=httpx.MockTransport(
-            lambda request: (_ for _ in ()).throw(AssertionError("unexpected provider call"))
-        )
+        client_factory=lambda _: (_ for _ in ()).throw(AssertionError("unexpected Gemini call"))
     )
+
     analysis = await agent.analyze(
         IDEA,
         {
@@ -264,12 +318,107 @@ async def test_competitor_only_research_returns_unknown_without_provider_call():
             ]
         },
     )
+
     assert analysis.demand_assessment.claim == "Unknown"
     assert analysis.demand_assessment.classification == "unknown"
     assert analysis.customer_segments == []
 
 
-def test_market_schema_requires_evidence_and_rejects_unprovided_urls():
+@pytest.mark.asyncio
+async def test_missing_gemini_key_is_reported(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(ServiceError, match="GEMINI_API_KEY"):
+        await MarketOpportunityAnalysisAgent().analyze(IDEA, RESEARCH)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["not json", "", "null"])
+async def test_gemini_invalid_json_or_empty_response_fails_clearly(content):
+    agent, _, _ = make_agent(content)
+    with pytest.raises(ServiceError, match="Gemini"):
+        await agent.analyze(IDEA, RESEARCH)
+
+
+@pytest.mark.asyncio
+async def test_gemini_timeout_and_connection_failures_are_distinct():
+    agent, _, _ = make_agent(error=httpx.ConnectError("offline"))
+    with pytest.raises(ServiceError, match="Could not connect") as connection_error:
+        await agent.analyze(IDEA, RESEARCH)
+    assert connection_error.value.status_code == 502
+
+    agent, _, _ = make_agent(error=httpx.ReadTimeout("timeout"))
+    with pytest.raises(ServiceError, match="timed out") as timeout_error:
+        await agent.analyze(IDEA, RESEARCH)
+    assert timeout_error.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_market_analysis_outer_deadline_returns_504_without_provider_response(monkeypatch):
+    client = FakeGeminiClient()
+
+    async def wait_forever(**kwargs):
+        await asyncio.Event().wait()
+
+    client.aio.models.generate_content = wait_forever
+    original_wait_for = asyncio.wait_for
+
+    async def short_diagnostic_deadline(awaitable, timeout=None):
+        return await original_wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr(
+        market_analysis_module,
+        "asyncio",
+        SimpleNamespace(
+            wait_for=short_diagnostic_deadline,
+            TimeoutError=asyncio.TimeoutError,
+        ),
+    )
+    agent = MarketOpportunityAnalysisAgent(client_factory=lambda _: client)
+
+    with pytest.raises(ServiceError, match="Gemini market analysis request timed out") as exc:
+        await agent.analyze(IDEA, RESEARCH)
+
+    assert exc.value.status_code == 504
+    client.aio.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_analysis_timeout_logs_safe_timing_metadata(monkeypatch, caplog):
+    client = FakeGeminiClient()
+
+    async def wait_forever(**kwargs):
+        await asyncio.Event().wait()
+
+    client.aio.models.generate_content = wait_forever
+    original_wait_for = asyncio.wait_for
+
+    async def short_diagnostic_deadline(awaitable, timeout=None):
+        return await original_wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr(
+        market_analysis_module,
+        "asyncio",
+        SimpleNamespace(
+            wait_for=short_diagnostic_deadline,
+            TimeoutError=asyncio.TimeoutError,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger="app.services.market_analysis")
+
+    with pytest.raises(ServiceError, match="timed out"):
+        await MarketOpportunityAnalysisAgent(client_factory=lambda _: client).analyze(IDEA, RESEARCH)
+
+    assert "request_started_utc=" in caplog.text
+    assert "elapsed_seconds=" in caplog.text
+    assert f"model={GEMINI_MODEL}" in caplog.text
+    assert "exception_type=TimeoutError" in caplog.text
+    assert "provider_http_status=unavailable" in caplog.text
+    assert "mock-gemini-key" not in caplog.text
+    assert SOURCE_URL not in caplog.text
+    assert RESEARCH["market_information"][0].content not in caplog.text
+
+
+def test_pydantic_schema_requires_evidence_and_rejects_unprovided_urls():
     payload = valid_result()
     payload["demand_assessment"]["evidence"] = []
     with pytest.raises(ValidationError, match="must cite at least one"):
@@ -283,80 +432,3 @@ def test_market_schema_requires_evidence_and_rejects_unprovided_urls():
         MarketOpportunityAnalysis.model_validate(
             payload, context={"allowed_urls": {SOURCE_URL}}
         )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "content",
-    [
-        "not json",
-        json.dumps({**valid_result(), "unexpected": True}),
-        json.dumps({**valid_result(), "customer_segments": "not an array"}),
-        json.dumps({**valid_result(), "opportunities": [{"claim": "missing fields"}]}),
-    ],
-)
-async def test_invalid_provider_outputs_fail_without_fabricating_analysis(content):
-    agent = MarketOpportunityAnalysisAgent(
-        transport=transport_with(completion(content))
-    )
-    with pytest.raises(ServiceError, match="market analysis"):
-        await agent.analyze(IDEA, RESEARCH)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,expected",
-    [
-        (401, "credential"),
-        (403, "denied"),
-        (402, "quota or billing"),
-        (429, "rate limit"),
-        (400, "HTTP 400"),
-    ],
-)
-async def test_market_provider_errors_are_reported(status, expected):
-    with pytest.raises(ServiceError, match=expected):
-        await MarketOpportunityAnalysisAgent(
-            transport=transport_with({"error": {"message": "provider failure"}}, status)
-        ).analyze(IDEA, RESEARCH)
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_code_is_logged_without_changing_public_error(caplog):
-    response = {
-        "error": {
-            "type": "tokens",
-            "code": "rate_limit_exceeded",
-            "message": "TPM limit reached; try again in 12 seconds.",
-        }
-    }
-    caplog.set_level(logging.WARNING, logger="app.services.market_analysis")
-    with pytest.raises(ServiceError, match="rate limit") as exc:
-        await MarketOpportunityAnalysisAgent(
-            transport=transport_with(response, status=429)
-        ).analyze(IDEA, RESEARCH)
-
-    assert exc.value.status_code == 503
-    assert "type=tokens" in caplog.text
-    assert "code=rate_limit_exceeded" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_market_provider_network_and_timeout_errors_are_distinct():
-    def connect(request):
-        raise httpx.ConnectError("offline", request=request)
-
-    with pytest.raises(ServiceError, match="Could not connect") as exc:
-        await MarketOpportunityAnalysisAgent(
-            transport=httpx.MockTransport(connect)
-        ).analyze(IDEA, RESEARCH)
-    assert exc.value.status_code == 502
-
-    def timeout(request):
-        raise httpx.ReadTimeout("timeout", request=request)
-
-    with pytest.raises(ServiceError, match="timed out") as exc:
-        await MarketOpportunityAnalysisAgent(
-            transport=httpx.MockTransport(timeout)
-        ).analyze(IDEA, RESEARCH)
-    assert exc.value.status_code == 504

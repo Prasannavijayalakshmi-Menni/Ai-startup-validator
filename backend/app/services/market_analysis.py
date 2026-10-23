@@ -1,43 +1,23 @@
 """Evidence-grounded market opportunity and customer segmentation analysis."""
 
+import asyncio
 import json
 import logging
 import math
 import os
 import re
+import time
+from datetime import datetime, timezone
 
 import httpx
 from pydantic import ValidationError
 
-from app.schemas import (
-    MarketOpportunityAnalysis,
-    Source,
-    StructuredIdea,
-)
+from app.schemas import MarketOpportunityAnalysis, Source, StructuredIdea
 from app.services.idea_extraction import ServiceError, _trust_env
 
 logger = logging.getLogger(__name__)
 MARKET_RESEARCH_CATEGORIES = ("market_information", "industry_trends")
-_DIAGNOSTIC_ID_HEADERS = (
-    "x-groq-id",
-    "x-request-id",
-    "request-id",
-    "x-correlation-id",
-)
-_DIAGNOSTIC_LIMIT_HEADERS = (
-    "retry-after",
-    "x-ratelimit-limit-requests",
-    "x-ratelimit-remaining-requests",
-    "x-ratelimit-reset-requests",
-    "x-ratelimit-limit-tokens",
-    "x-ratelimit-remaining-tokens",
-    "x-ratelimit-reset-tokens",
-)
-
-
-def _market_response_format() -> dict:
-    """Ask Groq for JSON syntax; enforce the full schema locally with Pydantic."""
-    return {"type": "json_object"}
+GEMINI_MODEL = "gemini-3.8-flash"
 
 
 def _text_values(value) -> list[str]:
@@ -50,83 +30,64 @@ def _text_values(value) -> list[str]:
     return []
 
 
-def _safe_diagnostic_value(value, api_key: str) -> str | None:
-    if not isinstance(value, (str, int, float)):
-        return None
-    text = str(value).strip()
-    if not text or (api_key and api_key in text):
-        return None
-    sensitive_pattern = (
-        r"(?i)bearer\s+|\bgsk_[A-Za-z0-9_-]+\b|\btvly-[A-Za-z0-9_-]+\b|"
-        r"api[_ -]?key|token|secret"
-    )
-    if re.search(sensitive_pattern, text):
-        return None
-    if len(text) > 120 or not re.fullmatch(r"[A-Za-z0-9._:/,+ -]+", text):
-        return None
-    return text
-
-
-def _provider_error_metadata(
-    response: httpx.Response,
-    api_key: str,
-    sensitive_texts: list[str],
-) -> tuple[str, str, str, bool, int | None, dict[str, str]]:
-    """Extract provider error metadata without exposing credentials or prompts."""
-    try:
-        payload = response.json()
-    except (ValueError, TypeError):
-        payload = {}
-    error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    if not isinstance(error, dict):
-        error = {}
-
-    error_type = re.sub(r"[^A-Za-z0-9_.-]", "", str(error.get("type") or ""))[:60]
-    code = re.sub(r"[^A-Za-z0-9_.-]", "", str(error.get("code") or ""))[:60]
-    message = str(error.get("message") or "").strip()
+def _safe_gemini_error_message(exc, api_key: str, sensitive_values: list[str]) -> str:
+    """Return bounded provider diagnostics with known secrets and prompt data removed."""
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or not message.strip():
+        return "provider did not include an error message"
     if api_key:
         message = message.replace(api_key, "[REDACTED]")
-    for value in sensitive_texts:
-        if value and len(value) >= 8:
+    for value in sensitive_values:
+        if value and len(value) >= 4:
             message = message.replace(value, "[REDACTED]")
     message = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", message)
-    message = re.sub(r"\bgsk_[A-Za-z0-9_-]+\b|\btvly-[A-Za-z0-9_-]+\b", "[REDACTED]", message)
+    message = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]", message)
     message = re.sub(
-        r"(?i)(api[_ -]?key|token|secret)\s*[:=]\s*\S+",
+        r"(?i)(api[_ -]?key|token|secret|authorization)\s*[:=]\s*[^,;\s]+",
         r"\1=[REDACTED]",
         message,
     )
-    message = " ".join(message.split())[:400]
+    message = re.sub(r"https?://\S+", "[REDACTED_URL]", message)
+    return " ".join(message.split())[:400] or "provider did not include an error message"
 
-    failed_generation = error.get("failed_generation")
-    if failed_generation is None:
-        failed_generation_length = None
-    elif isinstance(failed_generation, str):
-        failed_generation_length = len(failed_generation)
-    else:
-        failed_generation_length = len(json.dumps(failed_generation, ensure_ascii=True))
-    diagnostics: dict[str, str] = {}
-    for header in _DIAGNOSTIC_ID_HEADERS:
-        value = _safe_diagnostic_value(response.headers.get(header), api_key)
-        if value:
-            diagnostics[header] = value
-    groq_metadata = payload.get("x_groq") if isinstance(payload, dict) else None
-    if isinstance(groq_metadata, dict):
-        value = _safe_diagnostic_value(groq_metadata.get("id"), api_key)
-        if value:
-            diagnostics.setdefault("x_groq.id", value)
-    for header in _DIAGNOSTIC_LIMIT_HEADERS:
-        value = _safe_diagnostic_value(response.headers.get(header), api_key)
-        if value:
-            diagnostics[header] = value
-    return (
-        error_type,
-        code,
-        message,
-        failed_generation is not None,
-        failed_generation_length,
-        diagnostics,
+
+def _safe_gemini_request_id(exc) -> str | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {})
+    for header in ("x-goog-request-id", "x-request-id", "request-id"):
+        value = headers.get(header) if hasattr(headers, "get") else None
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:/+-]{1,120}", value.strip()):
+            return value.strip()
+    return None
+
+
+def _create_gemini_client(api_key: str):
+    """Create the official Google Gen AI client, honoring the project's proxy setting."""
+    from google import genai
+
+    return genai.Client(
+        api_key=api_key,
+        http_options=genai.types.HttpOptions(
+            async_client_args={"trust_env": _trust_env()},
+        ),
     )
+
+
+def _gemini_response_schema() -> dict:
+    """Adapt the existing Pydantic schema to Gemini Developer API's schema subset."""
+    schema = MarketOpportunityAnalysis.model_json_schema()
+
+    def remove_unsupported_properties(value):
+        if isinstance(value, dict):
+            value.pop("additionalProperties", None)
+            for nested in value.values():
+                remove_unsupported_properties(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                remove_unsupported_properties(nested)
+
+    remove_unsupported_properties(schema)
+    return schema
 
 
 def _unknown_analysis() -> MarketOpportunityAnalysis:
@@ -135,8 +96,8 @@ def _unknown_analysis() -> MarketOpportunityAnalysis:
 
 
 class MarketOpportunityAnalysisAgent:
-    def __init__(self, transport=None):
-        self.transport = transport
+    def __init__(self, client_factory=None):
+        self.client_factory = client_factory or _create_gemini_client
 
     async def analyze(
         self,
@@ -153,13 +114,9 @@ class MarketOpportunityAnalysisAgent:
         if not sources:
             return _unknown_analysis()
 
-        api_key = os.getenv("LLM_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise ServiceError("LLM_API_KEY is not configured.", 503)
-        model = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
-        base_url = os.getenv(
-            "LLM_BASE_URL", "https://api.groq.com/openai/v1"
-        ).rstrip("/")
+            raise ServiceError("GEMINI_API_KEY is not configured.", 503)
         source_data = [
             {"title": source.title, "url": source.url, "content": source.content}
             for source in sources
@@ -195,111 +152,156 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             "Return exactly one valid JSON object matching the requested schema. "
             "Use only supplied evidence, never invent claims or URLs."
         )
-        source_content_lengths = [len(source.content) for source in sources]
         prompt_chars = len(prompt)
         system_chars = len(system_prompt)
-        # This is a rough planning estimate, not a provider tokenizer count.
         rough_input_tokens = math.ceil((prompt_chars + system_chars) / 4)
         logger.info(
-            "Market analysis request metadata: model=%s response_format=json_object "
-            "source_count=%d source_content_chars=%d max_source_content_chars=%d "
-            "system_prompt_chars=%d user_prompt_chars=%d rough_input_tokens=%d "
-            "max_completion_tokens=provider_default",
-            model,
+            "Gemini market analysis request metadata: model=%s source_count=%d "
+            "source_content_chars=%d max_source_content_chars=%d system_prompt_chars=%d "
+            "user_prompt_chars=%d rough_input_tokens=%d max_completion_tokens=provider_default",
+            GEMINI_MODEL,
             len(sources),
-            sum(source_content_lengths),
-            max(source_content_lengths, default=0),
+            sum(len(source.content) for source in sources),
+            max((len(source.content) for source in sources), default=0),
             system_chars,
             prompt_chars,
             rough_input_tokens,
         )
 
+        client = None
+        async_client = None
+        request_started_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        request_started = time.monotonic()
+        logger.info(
+            "Gemini market analysis request started: model=%s request_started_utc=%s",
+            GEMINI_MODEL,
+            request_started_utc,
+        )
         try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                transport=self.transport,
-                trust_env=_trust_env(),
-            ) as client:
-                response = await client.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": model,
-                        "temperature": 0,
-                        "include_reasoning": False,
-                        "response_format": _market_response_format(),
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
+            client = self.client_factory(api_key)
+            async_client = client.aio
+            response = await asyncio.wait_for(
+                async_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config={
+                        "system_instruction": system_prompt,
+                        "response_mime_type": "application/json",
+                        "response_schema": _gemini_response_schema(),
                     },
-                )
-
-            if response.status_code >= 400:
-                sensitive_texts = [
+                ),
+                timeout=30.0,
+            )
+            logger.info(
+                "Gemini market analysis response received: model=%s elapsed_seconds=%.3f",
+                GEMINI_MODEL,
+                time.monotonic() - request_started,
+            )
+            content = response.text
+            if not isinstance(content, str) or not content.strip():
+                raise ServiceError("Gemini returned an empty market analysis response.")
+            return MarketOpportunityAnalysis.model_validate(
+                json.loads(content), context={"allowed_urls": allowed_urls}
+            )
+        except ServiceError:
+            raise
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                "Gemini market analysis request timed out: model=%s elapsed_seconds=%.3f "
+                "exception_type=%s provider_http_status=unavailable",
+                GEMINI_MODEL,
+                time.monotonic() - request_started,
+                type(exc).__name__,
+            )
+            raise ServiceError("Gemini market analysis request timed out.", 504) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "Gemini market analysis request timed out: model=%s elapsed_seconds=%.3f "
+                "exception_type=%s provider_http_status=unavailable",
+                GEMINI_MODEL,
+                time.monotonic() - request_started,
+                type(exc).__name__,
+            )
+            raise ServiceError("Gemini market analysis request timed out.", 504) from exc
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Gemini market analysis connection failed: model=%s elapsed_seconds=%.3f "
+                "exception_type=%s provider_http_status=unavailable",
+                GEMINI_MODEL,
+                time.monotonic() - request_started,
+                type(exc).__name__,
+            )
+            raise ServiceError("Could not connect to Gemini for market analysis.", 502) from exc
+        except ValidationError as exc:
+            logger.warning("Gemini market analysis failed schema or evidence validation")
+            raise ServiceError(
+                "Gemini market analysis did not match the required schema or cited an unsupported source URL."
+            ) from exc
+        except json.JSONDecodeError as exc:
+            logger.warning("Gemini returned invalid market analysis JSON")
+            raise ServiceError("Gemini returned invalid market analysis JSON; no analysis was produced.") from exc
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                status = None
+            provider_status = getattr(exc, "status", None)
+            if not isinstance(provider_status, str):
+                provider_status = "unknown"
+            provider_status = re.sub(r"[^A-Za-z0-9_.-]", "", provider_status)[:60] or "unknown"
+            safe_message = _safe_gemini_error_message(
+                exc,
+                api_key,
+                [
                     prompt,
+                    system_prompt,
                     *_text_values(source_data),
                     *_text_values(
                         idea.model_dump(
                             exclude={"estimated_budget", "estimated_budget_currency"}
                         )
                     ),
-                ]
-                (
-                    error_type,
-                    code,
-                    message,
-                    has_failed_generation,
-                    failed_generation_length,
-                    diagnostics,
-                ) = _provider_error_metadata(response, api_key, sensitive_texts)
-                logger.warning(
-                    "Market analysis provider error: status=%s type=%s code=%s "
-                    "message=%s failed_generation_present=%s failed_generation_chars=%s "
-                    "provider_diagnostics=%s",
-                    response.status_code,
-                    error_type or "unknown",
-                    code or "unknown",
-                    message or "unavailable",
-                    has_failed_generation,
-                    failed_generation_length,
-                    json.dumps(diagnostics, sort_keys=True),
-                )
-            if response.status_code == 401:
-                logger.warning("Market analysis provider authentication failed: HTTP 401")
-                raise ServiceError("Groq rejected the API credential during market analysis.", 503)
-            if response.status_code == 403:
-                logger.warning("Market analysis provider permission denied: HTTP 403")
-                raise ServiceError("Groq denied access to market analysis.", 503)
-            if response.status_code == 429:
-                raise ServiceError("Groq rate limit reached during market analysis.", 503)
-            if response.status_code == 402:
-                raise ServiceError("Groq account quota or billing limit prevents market analysis.", 503)
-            if response.status_code >= 400:
-                raise ServiceError(
-                    f"Groq rejected the market analysis request (HTTP {response.status_code}).",
-                    502,
-                )
-
-            content = response.json()["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise ServiceError("Groq returned an invalid market analysis response.")
-            return MarketOpportunityAnalysis.model_validate(
-                json.loads(content), context={"allowed_urls": allowed_urls}
+                ],
             )
-        except ServiceError:
-            raise
-        except httpx.TimeoutException as exc:
-            logger.warning("Market analysis provider timed out: %s", type(exc).__name__)
-            raise ServiceError("Market analysis provider request timed out.", 504) from exc
-        except httpx.RequestError as exc:
-            logger.warning("Market analysis provider connection failed: %s", type(exc).__name__)
-            raise ServiceError("Could not connect to the LLM provider for market analysis.", 502) from exc
-        except ValidationError as exc:
-            logger.warning("Market analysis response failed schema or evidence validation")
+            request_id = _safe_gemini_request_id(exc)
+            logger.warning(
+                "Gemini market analysis provider error: code=%s status=%s type=%s "
+                "request_id=%s elapsed_seconds=%.3f model=%s message=%s",
+                status or "unknown",
+                provider_status,
+                type(exc).__name__,
+                request_id or "unavailable",
+                time.monotonic() - request_started,
+                GEMINI_MODEL,
+                safe_message,
+            )
+            if status == 401:
+                raise ServiceError("Gemini rejected the configured API credential.", 503) from exc
+            if status == 403:
+                raise ServiceError("Gemini denied access to market analysis.", 503) from exc
+            if status == 429:
+                raise ServiceError("Gemini rate or quota limit reached during market analysis.", 503) from exc
+            if status == 400:
+                raise ServiceError(
+                    f"Gemini rejected the market analysis request (HTTP 400): {safe_message}",
+                    502,
+                ) from exc
             raise ServiceError(
-                "Groq market analysis did not match the required schema or cited an unsupported source URL."
+                f"Gemini market analysis provider request failed: {safe_message}", 502
             ) from exc
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            logger.warning("Invalid market analysis response: %s", type(exc).__name__)
-            raise ServiceError("Groq returned invalid market analysis JSON; no analysis was produced.") from exc
+        finally:
+            if async_client is not None:
+                close_async = getattr(async_client, "aclose", None)
+                if callable(close_async):
+                    try:
+                        await close_async()
+                    except Exception:
+                        logger.debug("Gemini async client close failed")
+            if client is not None:
+                close_sync = getattr(client, "close", None)
+                if callable(close_sync):
+                    try:
+                        close_sync()
+                    except Exception:
+                        logger.debug("Gemini client close failed")

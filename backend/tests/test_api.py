@@ -2,7 +2,15 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from app.schemas import AnalysisResponse, StructuredIdea, StartupIdea
+from app.schemas import (
+    AnalysisResponse,
+    CompetitorAnalysis,
+    MarketOpportunityAnalysis,
+    Source,
+    StructuredIdea,
+    StartupIdea,
+    SWOTRiskAnalysis,
+)
 from app.services.idea_extraction import IdeaExtractionAgent, ServiceError
 from app.services.market_research import MarketResearchAgent
 
@@ -51,6 +59,92 @@ def test_analysis_endpoint_preserves_submitted_budget_and_currency():
     assert response.status_code == 200
 
     assert response.json()["submitted_budget"] == {"amount":50000.0,"currency":"INR"}
+
+
+def test_analyze_route_runs_mocked_workflow_and_returns_all_agent_results():
+    from unittest.mock import AsyncMock, patch
+    from app.services.orchestration import ValidationReportService
+
+    idea = StructuredIdea(
+        problem="Students struggle to plan study time",
+        proposed_solution="An adaptive study planner",
+        target_customers=["Students"],
+        industry="Education",
+        key_features=["Adaptive schedule"],
+        value_proposition="Consistent study habits",
+        assumptions_and_missing_information=[],
+    )
+    source = Source(
+        title="Synthetic test research",
+        url="https://research.example/study-planning",
+        content="Synthetic mocked research snippet; not a real source.",
+    )
+    research = {
+        "market_information": [source],
+        "competitors_and_alternatives": [source],
+        "industry_trends": [],
+    }
+    market = MarketOpportunityAnalysis(
+        demand_assessment={
+            "claim": "Study planning is an identified need in the synthetic test data.",
+            "classification": "evidence_based",
+            "evidence": [source.url],
+        }
+    )
+    competitors = CompetitorAnalysis()
+    swot = SWOTRiskAnalysis()
+    events = []
+
+    async def response_for(stage, response, *args):
+        events.append((stage, args))
+        return response
+
+    def mock_stage(stage, response):
+        async def run(*args):
+            return await response_for(stage, response, *args)
+
+        return run
+
+    extractor = type("FakeExtractor", (), {})()
+    extractor.extract = AsyncMock(side_effect=mock_stage("extract", idea))
+    researcher = type("FakeResearcher", (), {})()
+    researcher.research = AsyncMock(side_effect=mock_stage("research", research))
+    market_agent = type("FakeMarketAgent", (), {})()
+    market_agent.analyze = AsyncMock(side_effect=mock_stage("market", market))
+    competitor_agent = type("FakeCompetitorAgent", (), {})()
+    competitor_agent.analyze = AsyncMock(side_effect=mock_stage("competitor", competitors))
+    swot_agent = type("FakeSwotAgent", (), {})()
+    swot_agent.analyze = AsyncMock(side_effect=mock_stage("swot", swot))
+    service = ValidationReportService(
+        extractor=extractor,
+        researcher=researcher,
+        market_analyzer=market_agent,
+        competitor_analyzer=competitor_agent,
+        swot_risk_analyzer=swot_agent,
+    )
+
+    with patch("main.ValidationReportService", return_value=service):
+        response = client.post(
+            "/api/ideas/analyze",
+            json={
+                **VALID,
+                "estimated_budget": 50000,
+                "estimated_budget_currency": "INR",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["market_analysis"]["demand_assessment"]["evidence"] == [source.url]
+    assert payload["competitor_analysis"] == {"competitors": [], "market_gaps": []}
+    assert payload["swot_risk_analysis"]["execution_risks"] == []
+    assert payload["submitted_budget"] == {"amount": 50000.0, "currency": "INR"}
+    assert [stage for stage, _ in events] == [
+        "extract", "research", "market", "competitor", "swot"
+    ]
+    assert events[2][1] == (idea, research)
+    assert events[3][1] == (idea, research, market)
+    assert events[4][1] == (idea, market, competitors, research)
 
 
 
