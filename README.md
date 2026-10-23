@@ -13,7 +13,10 @@ flowchart LR
   E -->|Pydantic validated idea| R[Market research agent]
   R -->|TAVILY_API_KEY| T[Tavily search]
   R --> O
-  O -->|structured idea and cited sources| API
+  O --> C[Competitor discovery and comparison agent]
+  C -->|Groq structured analysis grounded in Tavily sources| LLM
+  C --> O
+  O -->|idea, research, competitor_analysis| API
   API --> U
 ```
 
@@ -25,14 +28,14 @@ Python 3.10+ is recommended. From `backend/` create and activate a virtual envir
 
 ```powershell
 cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+python -m venv venv
+venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8001
 ```
 
-Set `LLM_API_KEY` and `TAVILY_API_KEY` in `backend/.env` before calling the analysis endpoint. `LLM_MODEL` defaults to `gpt-4o-mini`; `LLM_BASE_URL` defaults to `https://api.openai.com/v1` and can point to a compatible provider. `FRONTEND_ORIGIN` is a comma-separated allowlist. The analysis endpoint reports missing credentials explicitly and never returns fabricated results.
+Set `LLM_API_KEY` and `TAVILY_API_KEY` in `backend/.env` before calling the analysis endpoint. `LLM_MODEL` defaults to `openai/gpt-oss-20b`; `LLM_BASE_URL` defaults to `https://api.groq.com/openai/v1` and can point to a compatible provider. `FRONTEND_ORIGIN` is a comma-separated allowlist. The analysis endpoint reports missing credentials explicitly and rejects invalid structured output.
 
 ### Frontend
 
@@ -40,7 +43,7 @@ From the repository root:
 
 ```powershell
 npm install
-# Optional: set VITE_API_BASE_URL in a root .env.local; defaults to http://localhost:8000
+# Optional: set VITE_API_BASE_URL in a root .env.local; defaults to http://localhost:8001
 npm run dev
 ```
 
@@ -50,22 +53,25 @@ Vite serves on port 5173 by default.
 
 - `GET /` ? health message.
 - `POST /api/ideas` ? validates and echoes the submitted form fields (backward-compatible).
-- `POST /api/ideas/analyze` ? extracts a structured idea, searches Tavily, and returns `{ idea, market_research }`. Validation failures use HTTP 422; missing configuration returns HTTP 503; provider/network errors include a clear HTTP error.
+- `POST /api/ideas/analyze` ? extracts a structured idea, searches Tavily, and returns `{ idea, submitted_budget, market_research, competitor_analysis, research_note }`. Validation failures use HTTP 422; missing configuration returns HTTP 503; provider/network errors include a clear HTTP error.
 - `/docs` ? interactive Swagger UI.
 
 The LLM response schema contains `problem`, `proposed_solution`, `target_customers`, `industry`, `key_features`, `value_proposition`, and `assumptions_and_missing_information`. Research includes separate market information, competitor/alternative, and trend groups with source titles, URLs, and snippets.
+
+The competitor agent reuses the `competitors_and_alternatives` Tavily sources and returns typed competitor comparisons: offering, target customers, pricing (`"Unknown"` when unavailable), strengths, limitations, and evidence URLs. Potential gaps have a rationale and a strict `gap_type` of `evidence_based` or `hypothesis`. When no competitor search sources are available, it returns empty arrays without another LLM request. The React results section shows these fields and source links while retaining the existing response JSON.
 
 ## Tests and build
 
 ```powershell
 cd backend
-pytest
+.\venv\Scripts\python.exe -m pytest -q
 cd ..
+npm run lint
 npm run build
 ```
 
-Automated backend tests mock provider calls and cover request validation, missing keys, malformed LLM JSON, and education, healthcare, and agriculture inputs. Live provider behavior requires valid credentials and is not covered by mocked tests.
+Automated backend tests mock provider calls and cover competitor discovery, unknown pricing, evidence URL validation, malformed output, provider errors, timeouts, orchestration order, budget preservation, and API compatibility. Live provider behavior requires valid credentials and is not covered by mocked tests.
 
 ## Known limitations
 
-The LLM integration uses OpenAI-compatible chat completions and expects JSON mode. Tavily is queried once for each of three research categories. The service returns raw research sources, not a scored market viability conclusion. The legacy `backend/venv/main.py` is retained for compatibility; the maintained application entry point is `backend/main.py`.
+Tavily is queried once for each of three research categories; competitor analysis reuses those result records. The competitor agent makes one extra LLM request only when competitor sources exist. Citations are validated against the supplied Tavily URLs, but the application does not independently verify that each snippet semantically entails every generated claim. Users should inspect linked sources before relying on a claim. Competitor coverage depends on search results and does not prove that all competitors or market gaps have been found. The legacy `backend/venv/main.py` is retained for compatibility; the maintained application entry point is `backend/main.py`.

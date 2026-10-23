@@ -4,6 +4,184 @@ import "./App.css";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
 
+function isSafeExternalUrl(value) {
+  return typeof value === "string" && /^https?:\/\//i.test(value);
+}
+
+function DetailList({ title, values }) {
+  const items = Array.isArray(values)
+    ? values.filter((value) => typeof value === "string" && value.trim())
+    : [];
+  return (
+    <div className="competitor-detail">
+      <h4>{title}</h4>
+      {items.length > 0 ? (
+        <ul>{items.map((item, index) => <li key={`${title}-${index}`}>{item}</li>)}</ul>
+      ) : <p className="muted">Not available in the supplied research.</p>}
+    </div>
+  );
+}
+
+function EvidenceLinks({ urls }) {
+  const links = Array.isArray(urls) ? urls.filter(isSafeExternalUrl) : [];
+  if (!links.length) return <p className="muted">No source links available.</p>;
+  return (
+    <ul className="competitor-source-list">
+      {links.map((url, index) => (
+        <li key={`${url}-${index}`}>
+          <a href={url} target="_blank" rel="noopener noreferrer">Source {index + 1}</a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function MarketClaimView({ item }) {
+  if (!item || typeof item.claim !== "string") {
+    return <p className="muted">Unknown</p>;
+  }
+  const label = item.classification === "evidence_based"
+    ? "Evidence-based"
+    : item.classification === "hypothesis"
+      ? "Hypothesis"
+      : "Unknown";
+  return (
+    <div className="market-claim">
+      <p><strong>{item.claim}</strong> <span className={`claim-type claim-${item.classification || "unknown"}`}>{label}</span></p>
+      <EvidenceLinks urls={item.evidence} />
+    </div>
+  );
+}
+
+function MarketOpportunitySection({ analysis }) {
+  if (!analysis) return null;
+  const segments = Array.isArray(analysis.customer_segments) ? analysis.customer_segments : [];
+  const opportunities = Array.isArray(analysis.opportunities) ? analysis.opportunities : [];
+  const challenges = Array.isArray(analysis.challenges) ? analysis.challenges : [];
+  return (
+    <section className="competitor-analysis market-analysis" aria-labelledby="market-analysis-heading">
+      <h3 id="market-analysis-heading">Market opportunity and customer analysis</h3>
+      <p className="muted">Findings cite supplied research. Hypotheses are ideas to validate, not verified facts.</p>
+      <article className="competitor-card">
+        <h4>Market demand</h4>
+        <MarketClaimView item={analysis.demand_assessment} />
+      </article>
+      <h4>Customer segments and needs</h4>
+      {segments.length ? segments.map((segment, index) => (
+        <article className="competitor-card" key={`${segment.segment?.claim || "segment"}-${index}`}>
+          <MarketClaimView item={segment.segment} />
+          <h4>Needs</h4>
+          {Array.isArray(segment.needs) && segment.needs.length
+            ? segment.needs.map((need, needIndex) => <MarketClaimView key={`${need.claim}-${needIndex}`} item={need} />)
+            : <p className="muted">Unknown</p>}
+        </article>
+      )) : <p className="muted">No customer segments were supported by the supplied research.</p>}
+      <div className="market-claim-columns">
+        <div>
+          <h4>Opportunities</h4>
+          {opportunities.length ? opportunities.map((item, index) => <MarketClaimView key={`${item.claim}-${index}`} item={item} />) : <p className="muted">Unknown</p>}
+        </div>
+        <div>
+          <h4>Challenges</h4>
+          {challenges.length ? challenges.map((item, index) => <MarketClaimView key={`${item.claim}-${index}`} item={item} />) : <p className="muted">Unknown</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SWOTRiskSection({ analysis }) {
+  if (!analysis) return null;
+  const sections = [
+    ["Strengths", analysis.strengths],
+    ["Weaknesses", analysis.weaknesses],
+    ["Opportunities", analysis.opportunities],
+    ["Threats", analysis.threats],
+  ];
+  const risks = Array.isArray(analysis.execution_risks) ? analysis.execution_risks : [];
+  return (
+    <section className="competitor-analysis swot-analysis" aria-labelledby="swot-heading">
+      <h3 id="swot-heading">SWOT and execution risks</h3>
+      <p className="muted">Evidence-based items cite supplied research. Hypotheses are possibilities to validate, not established facts.</p>
+      <div className="swot-grid">
+        {sections.map(([title, items]) => (
+          <article className="competitor-card" key={title}>
+            <h4>{title}</h4>
+            {Array.isArray(items) && items.length
+              ? items.map((item, index) => <MarketClaimView key={`${item.claim}-${index}`} item={item} />)
+              : <p className="muted">Unknown</p>}
+          </article>
+        ))}
+      </div>
+      <h4>Execution risks and potential impact</h4>
+      {risks.length ? risks.map((item, index) => (
+        <article className="competitor-card" key={`${item.risk?.claim || "risk"}-${index}`}>
+          <h4>Risk</h4>
+          <MarketClaimView item={item.risk} />
+          <h4>Potential impact</h4>
+          <MarketClaimView item={item.potential_impact} />
+        </article>
+      )) : <p className="muted">No execution risks could be assessed from the supplied context.</p>}
+    </section>
+  );
+}
+
+function CompetitorAnalysisSection({ analysis }) {
+  if (!analysis) {
+    return (
+      <section className="competitor-analysis" aria-labelledby="competitor-heading">
+        <h3 id="competitor-heading">Competitor analysis</h3>
+        <p className="muted">Competitor analysis is unavailable in this response.</p>
+      </section>
+    );
+  }
+
+  const competitors = Array.isArray(analysis.competitors) ? analysis.competitors : [];
+  const gaps = Array.isArray(analysis.market_gaps) ? analysis.market_gaps : [];
+  return (
+    <section className="competitor-analysis" aria-labelledby="competitor-heading">
+      <h3 id="competitor-heading">Competitor analysis</h3>
+      <p className="muted">Competitor details are based on the supplied research. Source links identify the material used; claims are not independently fact-checked.</p>
+      {competitors.length > 0 ? (
+        <div className="competitor-list">
+          {competitors.map((competitor, index) => (
+            <article className="competitor-card" key={`${competitor.name || "competitor"}-${index}`}>
+              <h4>{competitor.name || "Competitor name unavailable"}</h4>
+              <p><strong>Classification:</strong> {competitor.competitor_type === "direct" ? "Direct competitor" : competitor.competitor_type === "indirect" ? "Indirect competitor" : "Unknown"}</p>
+              <p><strong>Offering:</strong> {competitor.offering || "Unknown"}</p>
+              <p><strong>Target customers:</strong> {competitor.target_customers || "Unknown"}</p>
+              <p><strong>Pricing:</strong> {competitor.pricing || "Unknown"}</p>
+              <DetailList title="Strengths" values={competitor.strengths} />
+              <DetailList title="Limitations" values={competitor.limitations} />
+              <div className="competitor-detail">
+                <h4>Evidence</h4>
+                <EvidenceLinks urls={competitor.evidence} />
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : <p className="muted">No competitors were supported by the available competitor research.</p>}
+
+      <h4>Potential market gaps</h4>
+      {gaps.length > 0 ? (
+        <div className="competitor-list">
+          {gaps.map((gap, index) => (
+            <article className="competitor-card" key={`${gap.description || "gap"}-${index}`}>
+              <h4>{gap.description || "Description unavailable"}</h4>
+              <p><strong>Type:</strong> {gap.gap_type === "evidence_based" ? "Evidence-based" : gap.gap_type === "hypothesis" ? "Hypothesis" : "Unknown"}</p>
+              <p>{gap.rationale || "No rationale was supplied."}</p>
+              <div className="competitor-detail">
+                <h4>Evidence</h4>
+                <EvidenceLinks urls={gap.evidence} />
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : <p className="muted">No potential market gaps were returned from available evidence.</p>}
+    </section>
+  );
+}
+
 function App() {
   const [theme, setTheme] = useState(
     localStorage.getItem("asv-theme") || "dark"
@@ -338,7 +516,7 @@ function App() {
             <div className="form-actions">
               <span><b>*</b> Required fields</span>
               <button className="submit-button" type="submit" disabled={isSubmitting}>
-                <span>✧</span> {isSubmitting ? "Analyzing?" : "Prepare My Idea"} <span>→</span>
+                <span>✧</span> {isSubmitting ? "Analyzing..." : "Prepare My Idea"} <span>→</span>
               </button>
             </div>
             {apiMessage && <p className={apiMessage.startsWith("Submission failed:") ? "error" : "success-message"} role="status">{apiMessage}</p>}
@@ -374,6 +552,9 @@ function App() {
               </div>
             </div>
             <pre>{JSON.stringify(submittedData, null, 2)}</pre>
+            <MarketOpportunitySection analysis={submittedData.market_analysis} />
+            <CompetitorAnalysisSection analysis={submittedData.competitor_analysis} />
+            <SWOTRiskSection analysis={submittedData.swot_risk_analysis} />
             <button
               type="button"
               className="copy-button"
