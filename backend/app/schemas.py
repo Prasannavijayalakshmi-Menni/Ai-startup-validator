@@ -139,8 +139,8 @@ class CustomerSegment(BaseModel):
 
 class MarketOpportunityAnalysis(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     demand_assessment: MarketClaim
+    industry_trends: list[MarketClaim] = Field(default_factory=list)
     customer_segments: list[CustomerSegment] = Field(default_factory=list)
     opportunities: list[MarketClaim] = Field(default_factory=list)
     challenges: list[MarketClaim] = Field(default_factory=list)
