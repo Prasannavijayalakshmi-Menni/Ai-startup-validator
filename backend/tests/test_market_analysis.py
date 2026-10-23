@@ -116,6 +116,8 @@ async def test_market_analysis_uses_json_object_mode_and_validates_result_locall
     assert seen["url"] == "https://api.groq.com/openai/v1/chat/completions"
     assert seen["body"]["model"] == "openai/gpt-oss-20b"
     assert seen["body"]["temperature"] == 0
+    assert seen["body"]["include_reasoning"] is False
+    assert "reasoning_format" not in seen["body"]
     assert seen["body"]["response_format"] == _market_response_format()
     assert seen["body"]["response_format"] == {"type": "json_object"}
     assert seen["body"]["messages"][0]["role"] == "system"
@@ -181,7 +183,14 @@ async def test_provider_400_logs_redacted_metadata_without_generation_or_prompt(
                     "code": "json_validate_failed",
                     "message": provider_message,
                     "failed_generation": generated_content,
-                }
+                },
+                "x_groq": {"id": "req_body_456"},
+            },
+            headers={
+                "x-groq-id": "req_header_123",
+                "x-ratelimit-reset-tokens": "1.5s",
+                "authorization": "Bearer response-header-secret",
+                "x-secret": "must-not-be-logged",
             },
             request=request,
         )
@@ -197,7 +206,12 @@ async def test_provider_400_logs_redacted_metadata_without_generation_or_prompt(
     assert "code=json_validate_failed" in caplog.text
     assert "failed_generation_present=True" in caplog.text
     assert f"failed_generation_chars={len(generated_content)}" in caplog.text
+    assert "req_header_123" in caplog.text
+    assert "req_body_456" in caplog.text
+    assert "x-ratelimit-reset-tokens" in caplog.text
     assert "mock-market-key" not in caplog.text
+    assert "response-header-secret" not in caplog.text
+    assert "must-not-be-logged" not in caplog.text
     assert generated_content not in caplog.text
     assert RESEARCH["market_information"][0].content not in caplog.text
     assert SOURCE_URL not in caplog.text

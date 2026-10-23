@@ -18,6 +18,21 @@ from app.services.idea_extraction import ServiceError, _trust_env
 
 logger = logging.getLogger(__name__)
 MARKET_RESEARCH_CATEGORIES = ("market_information", "industry_trends")
+_DIAGNOSTIC_ID_HEADERS = (
+    "x-groq-id",
+    "x-request-id",
+    "request-id",
+    "x-correlation-id",
+)
+_DIAGNOSTIC_LIMIT_HEADERS = (
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+)
 
 
 def _market_response_format() -> dict:
@@ -35,11 +50,28 @@ def _text_values(value) -> list[str]:
     return []
 
 
+def _safe_diagnostic_value(value, api_key: str) -> str | None:
+    if not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    if not text or (api_key and api_key in text):
+        return None
+    sensitive_pattern = (
+        r"(?i)bearer\s+|\bgsk_[A-Za-z0-9_-]+\b|\btvly-[A-Za-z0-9_-]+\b|"
+        r"api[_ -]?key|token|secret"
+    )
+    if re.search(sensitive_pattern, text):
+        return None
+    if len(text) > 120 or not re.fullmatch(r"[A-Za-z0-9._:/,+ -]+", text):
+        return None
+    return text
+
+
 def _provider_error_metadata(
     response: httpx.Response,
     api_key: str,
     sensitive_texts: list[str],
-) -> tuple[str, str, str, bool, int | None]:
+) -> tuple[str, str, str, bool, int | None, dict[str, str]]:
     """Extract provider error metadata without exposing credentials or prompts."""
     try:
         payload = response.json()
@@ -73,12 +105,27 @@ def _provider_error_metadata(
         failed_generation_length = len(failed_generation)
     else:
         failed_generation_length = len(json.dumps(failed_generation, ensure_ascii=True))
+    diagnostics: dict[str, str] = {}
+    for header in _DIAGNOSTIC_ID_HEADERS:
+        value = _safe_diagnostic_value(response.headers.get(header), api_key)
+        if value:
+            diagnostics[header] = value
+    groq_metadata = payload.get("x_groq") if isinstance(payload, dict) else None
+    if isinstance(groq_metadata, dict):
+        value = _safe_diagnostic_value(groq_metadata.get("id"), api_key)
+        if value:
+            diagnostics.setdefault("x_groq.id", value)
+    for header in _DIAGNOSTIC_LIMIT_HEADERS:
+        value = _safe_diagnostic_value(response.headers.get(header), api_key)
+        if value:
+            diagnostics[header] = value
     return (
         error_type,
         code,
         message,
         failed_generation is not None,
         failed_generation_length,
+        diagnostics,
     )
 
 
@@ -179,6 +226,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
                     json={
                         "model": model,
                         "temperature": 0,
+                        "include_reasoning": False,
                         "response_format": _market_response_format(),
                         "messages": [
                             {"role": "system", "content": system_prompt},
@@ -197,18 +245,25 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
                         )
                     ),
                 ]
-                error_type, code, message, has_failed_generation, failed_generation_length = (
-                    _provider_error_metadata(response, api_key, sensitive_texts)
-                )
+                (
+                    error_type,
+                    code,
+                    message,
+                    has_failed_generation,
+                    failed_generation_length,
+                    diagnostics,
+                ) = _provider_error_metadata(response, api_key, sensitive_texts)
                 logger.warning(
                     "Market analysis provider error: status=%s type=%s code=%s "
-                    "message=%s failed_generation_present=%s failed_generation_chars=%s",
+                    "message=%s failed_generation_present=%s failed_generation_chars=%s "
+                    "provider_diagnostics=%s",
                     response.status_code,
                     error_type or "unknown",
                     code or "unknown",
                     message or "unavailable",
                     has_failed_generation,
                     failed_generation_length,
+                    json.dumps(diagnostics, sort_keys=True),
                 )
             if response.status_code == 401:
                 logger.warning("Market analysis provider authentication failed: HTTP 401")
