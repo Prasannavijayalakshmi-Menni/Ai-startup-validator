@@ -1,5 +1,4 @@
 from typing import Literal
-
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -151,7 +150,12 @@ class MarketOpportunityAnalysis(BaseModel):
         if "allowed_urls" not in context:
             return self
         allowed_urls = set(context["allowed_urls"])
-        claims = [self.demand_assessment, *self.opportunities, *self.challenges]
+        claims = [
+         self.demand_assessment,
+        *self.industry_trends,
+        *self.opportunities,
+        *self.challenges,
+        ]
         for segment in self.customer_segments:
             claims.extend([segment.segment, *segment.needs])
         citations = {url for claim in claims for url in claim.evidence}
@@ -227,9 +231,11 @@ class AnalysisResponse(BaseModel):
             for url in item.evidence
         }
         market_claims = [
-            self.market_analysis.demand_assessment,
-            *self.market_analysis.opportunities,
-            *self.market_analysis.challenges,
+       self.market_analysis.demand_assessment,
+        *self.market_analysis.industry_trends,
+        *self.market_analysis.opportunities,
+         *self.market_analysis.challenges,
+
         ]
         for segment in self.market_analysis.customer_segments:
             market_claims.extend([segment.segment, *segment.needs])
