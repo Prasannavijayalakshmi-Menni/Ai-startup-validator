@@ -1,9 +1,16 @@
+"""Evidence-grounded competitor analysis using Google Gemini with Groq fallback."""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
 import os
 import re
+import time
+from datetime import datetime, timezone
+from typing import Any
 
-import httpx
 from pydantic import ValidationError
 
 from app.schemas import (
@@ -12,146 +19,191 @@ from app.schemas import (
     Source,
     StructuredIdea,
 )
-from app.services.idea_extraction import ServiceError, _trust_env
+from app.services.provider_runner import (
+    GEMINI_MODEL,
+    ServiceError,
+    _create_gemini_client,
+    _safe_gemini_error_message,
+    _safe_gemini_request_id,
+    _text_values,
+    _trust_env,
+    execute_with_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _competitor_response_format(source_urls: list[str]) -> dict:
-    """Build Groq strict JSON Schema mode's response format for this analysis."""
-    url_schema = {"type": "string", "enum": source_urls}
-    competitor_schema = {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "competitor_type": {
-                "type": "string",
-                "enum": ["direct", "indirect", "unknown"],
-            },
-            "offering": {"type": "string"},
-            "target_customers": {"type": "string"},
-            "pricing": {"type": "string"},
-            "strengths": {"type": "array", "items": {"type": "string"}},
-            "limitations": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "array", "items": url_schema},
-        },
-        "required": [
-            "name",
-            "competitor_type",
-            "offering",
-            "target_customers",
-            "pricing",
-            "strengths",
-            "limitations",
-            "evidence",
-        ],
-        "additionalProperties": False,
-    }
-    gap_schema = {
-        "type": "object",
-        "properties": {
-            "description": {"type": "string"},
-            "rationale": {"type": "string"},
-            "gap_type": {
-                "type": "string",
-                "enum": ["evidence_based", "hypothesis"],
-            },
-            "evidence": {"type": "array", "items": url_schema},
-        },
-        "required": ["description", "rationale", "gap_type", "evidence"],
-        "additionalProperties": False,
-    }
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "competitor_analysis",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "competitors": {
-                        "type": "array",
-                        "items": competitor_schema,
-                    },
-                    "market_gaps": {"type": "array", "items": gap_schema},
-                },
-                "required": ["competitors", "market_gaps"],
-                "additionalProperties": False,
-            },
-        },
-    }
+def _groq_response_format_competitor() -> dict[str, Any]:
+    """Use plain json_object mode for Groq competitor analysis.
 
-
-def _safe_provider_error(response: httpx.Response, api_key: str) -> str:
-    """Return only the structured provider error, with credential-like text redacted."""
-    try:
-        payload = response.json()
-    except (ValueError, TypeError):
-        return "provider response body was not valid JSON"
-
-    error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    if not isinstance(error, dict):
-        return "provider returned an unstructured error body"
-
-    fields = []
-    for name in ("type", "code", "message"):
-        value = error.get(name)
-        if not isinstance(value, (str, int, float)):
-            continue
-        text = str(value)
-        if api_key:
-            text = text.replace(api_key, "[REDACTED]")
-        text = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", text)
-        text = re.sub(r"\bgsk_[A-Za-z0-9_-]+\b", "[REDACTED]", text)
-        text = re.sub(r"\btvly-[A-Za-z0-9_-]+\b", "[REDACTED]", text)
-        text = re.sub(
-            r"(?i)(api[_ -]?key|token|secret)\s*[:=]\s*\S+",
-            r"\1=[REDACTED]",
-            text,
-        )
-        text = " ".join(text.split())[:500]
-        if text:
-            fields.append(f"{name}={text}")
-
-    # Groq may include the rejected generation with json_validate_failed. It can
-    # contain submitted idea/research text, so diagnose its format without
-    # logging or returning the generation itself.
-    if error.get("code") == "json_validate_failed":
-        failed_generation = error.get("failed_generation")
-        # Some provider errors use a structured diagnostic object. Only inspect
-        # an attempted JSON string; never emit its content in application logs.
-        if isinstance(failed_generation, dict):
-            generated_text = failed_generation.get("attempted_arguments")
-            detail_available = bool(failed_generation)
-        else:
-            generated_text = failed_generation
-            detail_available = failed_generation is not None
-
-        if isinstance(generated_text, str):
-            if re.search(r"```", generated_text):
-                diagnosis = "markdown_fences"
-            else:
-                try:
-                    generated_value = json.loads(generated_text)
-                except json.JSONDecodeError as exc:
-                    diagnosis = (
-                        f"invalid_json line={exc.lineno} column={exc.colno}"
-                    )
-                else:
-                    root_type = (
-                        "object" if isinstance(generated_value, dict)
-                        else type(generated_value).__name__
-                    )
-                    diagnosis = f"valid_json_root={root_type}"
-        else:
-            diagnosis = "details_available_unparsed" if detail_available else "unavailable"
-        fields.append(f"failed_generation_diagnosis={diagnosis}")
-    return "; ".join(fields) or "provider returned no structured error details"
+    Groq's strict json_schema mode with enum-constrained evidence arrays causes
+    HTTP 400 ("Generated JSON does not match the expected schema") when the model
+    cannot find a token that satisfies the URL enum.  We use json_object mode
+    instead and validate evidence URLs via Pydantic after parsing.
+    """
+    return {"type": "json_object"}
 
 
 class CompetitorAnalysisAgent:
-    def __init__(self, transport=None):
+    def __init__(self, client_factory=None, transport=None):
+        self.client_factory = client_factory or _create_gemini_client
         self.transport = transport
+
+    async def _analyze_gemini(
+        self,
+        idea: StructuredIdea,
+        sources: list[Source],
+        prompt: str,
+        system_prompt: str,
+        source_data: list[dict[str, str]],
+        allowed_urls: list[str],
+    ) -> CompetitorAnalysis:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ServiceError("GEMINI_API_KEY is not configured.", 503)
+
+        gemini_model = os.getenv("GEMINI_MODEL", GEMINI_MODEL)
+        request_started_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        request_started = time.monotonic()
+        logger.info(
+            "Gemini competitor analysis request started: model=%s request_started_utc=%s "
+            "source_count=%d",
+            gemini_model,
+            request_started_utc,
+            len(sources),
+        )
+
+        client = None
+        async_client = None
+        try:
+            client = self.client_factory(api_key)
+            async_client = client.aio
+            response = await asyncio.wait_for(
+                async_client.models.generate_content(
+                    model=gemini_model,
+                    contents=prompt,
+                    config={
+                        "system_instruction": system_prompt,
+                        "response_mime_type": "application/json",
+                    },
+                ),
+                timeout=25.0,
+            )
+            logger.info(
+                "Gemini competitor analysis response received: model=%s elapsed_seconds=%.3f",
+                gemini_model,
+                time.monotonic() - request_started,
+            )
+            content = response.text
+            if not isinstance(content, str) or not content.strip():
+                raise ServiceError("Gemini returned an empty competitor analysis response.")
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ServiceError(
+                    "Gemini returned invalid competitor analysis JSON; no analysis was produced."
+                ) from exc
+            try:
+                return CompetitorAnalysis.model_validate(
+                    payload, context={"allowed_urls": allowed_urls}
+                )
+            except ValidationError as exc:
+                raise ServiceError(
+                    "Gemini competitor analysis did not match the required schema or cited an unsupported source URL."
+                ) from exc
+        except ServiceError:
+            raise
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                "Gemini competitor analysis request timed out: model=%s elapsed_seconds=%.3f "
+                "exception_type=%s provider_http_status=unavailable",
+                gemini_model,
+                time.monotonic() - request_started,
+                type(exc).__name__,
+            )
+            raise ServiceError("Gemini competitor analysis request timed out.", 504) from exc
+        except Exception as exc:
+            import httpx
+
+            if isinstance(exc, httpx.TimeoutException):
+                logger.warning(
+                    "Gemini competitor analysis request timed out: model=%s elapsed_seconds=%.3f "
+                    "exception_type=%s provider_http_status=unavailable",
+                    gemini_model,
+                    time.monotonic() - request_started,
+                    type(exc).__name__,
+                )
+                raise ServiceError("Gemini competitor analysis request timed out.", 504) from exc
+            if isinstance(exc, httpx.RequestError):
+                logger.warning(
+                    "Gemini competitor analysis connection failed: model=%s elapsed_seconds=%.3f "
+                    "exception_type=%s provider_http_status=unavailable",
+                    gemini_model,
+                    time.monotonic() - request_started,
+                    type(exc).__name__,
+                )
+                raise ServiceError("Could not connect to Gemini for competitor analysis.", 502) from exc
+
+            status = getattr(exc, "code", None)
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                status = None
+            provider_status = getattr(exc, "status", None)
+            if not isinstance(provider_status, str):
+                provider_status = "unknown"
+            provider_status = re.sub(r"[^A-Za-z0-9_.-]", "", provider_status)[:60] or "unknown"
+            safe_message = _safe_gemini_error_message(
+                exc,
+                api_key,
+                [
+                    prompt,
+                    system_prompt,
+                    *_text_values(source_data),
+                    *_text_values(idea.model_dump(exclude={"estimated_budget", "estimated_budget_currency"})),
+                ],
+            )
+            request_id = _safe_gemini_request_id(exc)
+            logger.warning(
+                "Gemini competitor analysis provider error: code=%s status=%s type=%s "
+                "request_id=%s elapsed_seconds=%.3f model=%s message=%s",
+                status or "unknown",
+                provider_status,
+                type(exc).__name__,
+                request_id or "unavailable",
+                time.monotonic() - request_started,
+                gemini_model,
+                safe_message,
+            )
+            if status == 401:
+                raise ServiceError("Gemini rejected the configured API credential.", 503) from exc
+            if status == 403:
+                raise ServiceError("Gemini denied access to competitor analysis.", 503) from exc
+            if status == 429:
+                raise ServiceError("Gemini rate or quota limit reached during competitor analysis.", 503) from exc
+            if status == 400:
+                raise ServiceError(
+                    f"Gemini rejected the competitor analysis request (HTTP 400): {safe_message}",
+                    502,
+                ) from exc
+            raise ServiceError(
+                f"Gemini competitor analysis provider request failed: {safe_message}", 502
+            ) from exc
+        finally:
+            if async_client is not None:
+                close_async = getattr(async_client, "aclose", None)
+                if callable(close_async):
+                    try:
+                        await close_async()
+                    except Exception:
+                        logger.debug("Gemini async client close failed")
+            if client is not None:
+                close_sync = getattr(client, "close", None)
+                if callable(close_sync):
+                    try:
+                        close_sync()
+                    except Exception:
+                        logger.debug("Gemini client close failed")
 
     async def analyze(
         self,
@@ -160,29 +212,17 @@ class CompetitorAnalysisAgent:
         market_analysis: MarketOpportunityAnalysis | None = None,
     ) -> CompetitorAnalysis:
         sources = research.get("competitors_and_alternatives", [])
-
-        # No competitor search results: do not make another LLM request.
         if not sources:
             return CompetitorAnalysis()
 
-        api_key = os.getenv("LLM_API_KEY")
-        if not api_key:
-            raise ServiceError("LLM_API_KEY is not configured.", 503)
-
-        model = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
-        base_url = os.getenv(
-            "LLM_BASE_URL", "https://api.groq.com/openai/v1"
-        ).rstrip("/")
+        allowed_urls = sorted({source.url for source in sources})
+        if not allowed_urls:
+            return CompetitorAnalysis()
 
         source_data = [
-            {
-                "title": source.title,
-                "url": source.url,
-                "content": source.content,
-            }
+            {"title": source.title, "url": source.url, "content": source.content}
             for source in sources
         ]
-        allowed_urls = sorted({source.url for source in sources})
         market_context = (
             market_analysis.model_dump(mode="json")
             if market_analysis is not None
@@ -198,6 +238,11 @@ class CompetitorAnalysisAgent:
             }
         )
 
+        system_prompt = (
+            "Return exactly one valid JSON object and nothing else. "
+            "Do not use Markdown fences or surrounding text. "
+            "Never fabricate facts or source URLs."
+        )
         prompt = f"""
 Analyze the startup idea and the supplied competitor research.
 
@@ -253,92 +298,21 @@ Rules:
 - Do not include the submitted budget in this analysis.
 """
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                transport=self.transport,
-                trust_env=_trust_env(),
-            ) as client:
-                response = await client.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": model,
-                        "temperature": 0,
-                        "response_format": _competitor_response_format(allowed_urls),
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Return exactly one valid JSON object and nothing else. "
-                                    "Do not use Markdown fences or surrounding text. "
-                                    "Never fabricate facts or source URLs."
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                    },
-                )
-
-            if response.status_code == 401:
-                logger.warning("Competitor analysis provider authentication failed: HTTP 401")
-                raise ServiceError("Groq rejected the API credential during competitor analysis.", 503)
-            if response.status_code == 403:
-                logger.warning("Competitor analysis provider permission denied: HTTP 403")
-                raise ServiceError("Groq denied access to competitor analysis.", 503)
-            if response.status_code == 429:
-                raise ServiceError("Groq rate limit reached.", 503)
-            if response.status_code == 402:
-                raise ServiceError("Groq account quota or billing limit prevents competitor analysis.", 503)
-            if response.status_code == 400:
-                provider_error = _safe_provider_error(response, api_key)
-                logger.warning(
-                    "Competitor analysis provider rejected request: HTTP 400; %s",
-                    provider_error,
-                )
-                raise ServiceError("Groq rejected the competitor analysis request; check the model and request configuration.", 502)
-            if response.status_code >= 400:
-                logger.warning(
-                    "Competitor analysis provider error: HTTP %s",
-                    response.status_code,
-                )
-                raise ServiceError(
-                    f"Groq returned HTTP {response.status_code} "
-                    "during competitor analysis."
-                )
-
-            content = response.json()["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise ServiceError(
-                    "Groq returned an invalid competitor analysis."
-                )
-
-            return CompetitorAnalysis.model_validate(
-                json.loads(content), context={"allowed_urls": allowed_urls}
-            )
-
-        except ServiceError:
-            raise
-        except httpx.TimeoutException as exc:
-            raise ServiceError(
-                "Competitor analysis timed out.", 504
-            ) from exc
-        except httpx.RequestError as exc:
-            logger.warning(
-                "Competitor analysis request failed: %s",
-                type(exc).__name__,
-            )
-            raise ServiceError(
-                "Could not connect to the LLM provider "
-                "for competitor analysis."
-            ) from exc
-        except ValidationError as exc:
-            logger.warning("Competitor analysis response failed schema or evidence validation")
-            raise ServiceError(
-                "Groq competitor analysis did not match the required schema or cited an unsupported source URL."
-            ) from exc
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            logger.warning("Invalid competitor analysis response: %s", type(exc).__name__)
-            raise ServiceError(
-                "Groq returned an invalid competitor analysis."
-            ) from exc
+        return await execute_with_fallback(
+            agent_name="competitor analysis",
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            validator=CompetitorAnalysis.model_validate,
+            validation_context={"allowed_urls": allowed_urls},
+            gemini_caller=lambda: self._analyze_gemini(
+                idea, sources, prompt, system_prompt, source_data, allowed_urls
+            ),
+            transport=self.transport,
+            groq_response_format=_groq_response_format_competitor(),
+            sensitive_values=[
+                prompt,
+                system_prompt,
+                *_text_values(source_data),
+                *_text_values(idea.model_dump(exclude={"estimated_budget", "estimated_budget_currency"})),
+            ],
+        )

@@ -96,6 +96,7 @@ class FakeGeminiClient:
 @pytest.fixture(autouse=True)
 def configured_provider(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
 
 def make_agent(response=None, error=None, captured=None):
@@ -126,10 +127,7 @@ async def test_gemini_success_uses_teammate_model_and_validates_typed_response()
     request = captured["request"]
     assert request["model"] == GEMINI_MODEL == "gemini-3.8-flash"
     assert request["config"]["response_mime_type"] == "application/json"
-    schema = request["config"]["response_schema"]
-    assert schema["title"] == "MarketOpportunityAnalysis"
-    assert "demand_assessment" in schema["required"]
-    assert "additionalProperties" not in json.dumps(schema)
+    assert "response_schema" not in request["config"]
     assert request["config"]["system_instruction"]
     prompt = request["contents"]
     assert "one valid JSON object only" in prompt
@@ -142,7 +140,7 @@ async def test_gemini_success_uses_teammate_model_and_validates_typed_response()
 
 
 @pytest.mark.asyncio
-async def test_gemini_sdk_serializes_supported_response_schema_without_extra_properties():
+async def test_gemini_sdk_serializes_json_mode_without_remote_response_schema():
     serialized = {}
 
     def handler(request):
@@ -181,11 +179,9 @@ async def test_gemini_sdk_serializes_supported_response_schema_without_extra_pro
         client.close()
 
     assert isinstance(analysis, MarketOpportunityAnalysis)
-    request_schema = serialized["body"]["generationConfig"]["responseSchema"]
-    assert request_schema["type"] == "OBJECT"
-    assert "demand_assessment" in request_schema["required"]
-    assert "additionalProperties" not in json.dumps(request_schema)
-    assert "additional_properties" not in json.dumps(request_schema)
+    generation_config = serialized["body"]["generationConfig"]
+    assert generation_config == {"responseMimeType": "application/json"}
+    assert "responseSchema" not in serialized["body"]
 
 
 @pytest.mark.asyncio

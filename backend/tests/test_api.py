@@ -1,5 +1,6 @@
 import json
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 from main import app
 from app.schemas import (
@@ -59,6 +60,21 @@ def test_analysis_endpoint_preserves_submitted_budget_and_currency():
     assert response.status_code == 200
 
     assert response.json()["submitted_budget"] == {"amount":50000.0,"currency":"INR"}
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:5174", "http://localhost:5174"])
+def test_vite_5174_origins_pass_analysis_cors_preflight(origin):
+    response = client.options(
+        "/api/ideas/analyze",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
 
 
 def test_analyze_route_runs_mocked_workflow_and_returns_all_agent_results():
@@ -149,41 +165,48 @@ def test_analyze_route_runs_mocked_workflow_and_returns_all_agent_results():
 
 
 @pytest.mark.asyncio
-
 async def test_llm_connection_failure_is_distinguished(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
-    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    async def raise_connect_error(**kwargs):
+        raise httpx.ConnectError("unavailable")
 
-    import httpx
-
-    transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ConnectError("unavailable", request=request)))
-
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=raise_connect_error),
+            aclose=AsyncMock(),
+        ),
+        close=lambda: None,
+    )
     with pytest.raises(ServiceError, match="Could not connect") as exc:
-
-        await IdeaExtractionAgent(transport=transport).extract(
-
+        await IdeaExtractionAgent(client_factory=lambda _: fake_client).extract(
             __import__("app.schemas", fromlist=["StartupIdea"]).StartupIdea(**VALID))
-
     assert exc.value.status_code == 502
 
 
-
 @pytest.mark.asyncio
-
 async def test_llm_timeout_is_distinguished(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
-    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    async def raise_timeout(**kwargs):
+        raise httpx.ReadTimeout("timed out")
 
-    import httpx
-
-    transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("timed out", request=request)))
-
-    with pytest.raises(ServiceError, match=r"timed out \(ReadTimeout\)") as exc:
-
-        await IdeaExtractionAgent(transport=transport).extract(
-
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=raise_timeout),
+            aclose=AsyncMock(),
+        ),
+        close=lambda: None,
+    )
+    with pytest.raises(ServiceError, match=r"timed out") as exc:
+        await IdeaExtractionAgent(client_factory=lambda _: fake_client).extract(
             __import__("app.schemas", fromlist=["StartupIdea"]).StartupIdea(**VALID))
-
     assert exc.value.status_code == 504
 
 

@@ -1,8 +1,7 @@
 
 import { useState } from "react";
 import "./App.css";
-
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
+import { analyzeIdea, ApiConnectionError } from "./api";
 
 function isSafeExternalUrl(value) {
   return typeof value === "string" && /^https?:\/\//i.test(value);
@@ -280,10 +279,7 @@ function App() {
     setApiMessage("");
     setIsSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/ideas/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const result = await analyzeIdea({
           idea_description: structuredData.idea_description,
           target_customers: formData.customers.trim(),
           industry: structuredData.industry,
@@ -291,20 +287,12 @@ function App() {
           estimated_budget: structuredData.estimated_budget.amount,
           estimated_budget_currency: structuredData.estimated_budget.currency,
           additional_information: structuredData.additional_information,
-        }),
       });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const detail = Array.isArray(result.detail)
-          ? result.detail.map((item) => `${item.loc?.slice(-1)[0] || "field"}: ${item.msg}`).join("; ")
-          : result.detail || result.message || `Request failed (HTTP ${response.status}).`;
-        throw new Error(detail);
-      }
       setSubmittedData(result);
       setApiMessage("Idea analyzed successfully.");
     } catch (error) {
-      const message = error instanceof TypeError
-        ? "Could not connect to the backend. Confirm it is running and VITE_API_BASE_URL is correct."
+      const message = error instanceof ApiConnectionError
+        ? error.message
         : error.message || "Unexpected backend error.";
       setApiMessage(`Submission failed: ${message}`);
     } finally {

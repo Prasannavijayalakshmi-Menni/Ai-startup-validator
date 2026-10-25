@@ -1,8 +1,9 @@
 """Offline competitor-agent checks using fictional, explicitly synthetic fixtures."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 
 from app.schemas import MarketOpportunityAnalysis, Source, StructuredIdea
@@ -143,37 +144,49 @@ MOCK_RESULT = {
 
 @pytest.fixture(autouse=True)
 def configure_mock_provider(monkeypatch):
-    monkeypatch.setenv("LLM_API_KEY", "offline-test-key")
-    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-20b")
-    monkeypatch.setenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setenv("GEMINI_API_KEY", "offline-test-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+
+class FakeGeminiClient:
+    def __init__(self, response=None, error=None, captured=None):
+        self.captured = captured if captured is not None else {}
+        self.response = response
+        self.error = error
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self.generate_content))
+        self.aio.aclose = AsyncMock()
+        self.close = lambda: None
+
+    async def generate_content(self, **kwargs):
+        self.captured["request"] = kwargs
+        if self.error:
+            raise self.error
+        return SimpleNamespace(text=self.response)
+
+
+def make_agent(response=None, error=None, captured=None):
+    captured = captured if captured is not None else {}
+
+    def factory(api_key):
+        return FakeGeminiClient(response=response, error=error, captured=captured)
+
+    return CompetitorAnalysisAgent(client_factory=factory), captured
 
 
 @pytest.mark.asyncio
 async def test_synthetic_sources_cover_classification_comparison_gaps_and_market_context():
     captured = {}
+    agent, captured = make_agent(json.dumps(MOCK_RESULT), captured=captured)
 
-    def handler(request):
-        captured["body"] = json.loads(request.content)
-        prompt = captured["body"]["messages"][1]["content"]
-        assert "SYNTHETIC TEST SOURCE" in prompt
-        assert "not real research" in prompt
-        assert "High school students" in prompt
-        assert "Adjust study sessions when exam dates change." in prompt
-        assert all(url in prompt for url in SOURCE_URLS)
-        assert "estimated_budget" not in prompt
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {"message": {"content": json.dumps(MOCK_RESULT)}}
-                ]
-            },
-            request=request,
-        )
+    result = await agent.analyze(IDEA, RESEARCH, MARKET_ANALYSIS)
 
-    result = await CompetitorAnalysisAgent(
-        transport=httpx.MockTransport(handler)
-    ).analyze(IDEA, RESEARCH, MARKET_ANALYSIS)
+    prompt = captured["request"]["contents"]
+    assert "SYNTHETIC TEST SOURCE" in prompt
+    assert "not real research" in prompt
+    assert "High school students" in prompt
+    assert "Adjust study sessions when exam dates change." in prompt
+    assert all(url in prompt for url in SOURCE_URLS)
+    assert "estimated_budget" not in prompt
 
     assert [competitor.competitor_type for competitor in result.competitors] == [
         "direct",
@@ -205,25 +218,21 @@ async def test_synthetic_fixture_rejects_citations_outside_supplied_urls():
         ],
         "market_gaps": [],
     }
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps(invalid_result)}}]},
-            request=request,
-        )
-    )
+    agent, _ = make_agent(json.dumps(invalid_result))
 
     with pytest.raises(ServiceError, match="unsupported source URL"):
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
+        await agent.analyze(IDEA, RESEARCH)
 
 
 @pytest.mark.asyncio
-async def test_empty_synthetic_competitor_research_skips_provider_request():
-    def unexpected_request(request):
+async def test_empty_synthetic_competitor_research_skips_provider_request(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    def unexpected_factory(api_key):
         raise AssertionError("empty competitor research must not call the provider")
 
     result = await CompetitorAnalysisAgent(
-        transport=httpx.MockTransport(unexpected_request)
+        client_factory=unexpected_factory
     ).analyze(IDEA, {"competitors_and_alternatives": []}, MARKET_ANALYSIS)
 
     assert result.competitors == []

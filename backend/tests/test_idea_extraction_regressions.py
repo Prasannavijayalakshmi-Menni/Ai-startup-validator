@@ -1,4 +1,10 @@
+"""Regression tests for IdeaExtractionAgent using the Gemini SDK mock pattern."""
+
+import asyncio
 import json
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -6,6 +12,7 @@ from pydantic import ValidationError
 
 from app.schemas import StartupIdea, StructuredIdea
 from app.services.idea_extraction import IdeaExtractionAgent, ServiceError
+from app.services.market_analysis import GEMINI_MODEL
 
 
 IDEA_INPUT = {
@@ -28,67 +35,89 @@ VALID_RESPONSE = {
 
 
 @pytest.fixture(autouse=True)
-def mock_llm_key(monkeypatch):
-    monkeypatch.setenv("LLM_API_KEY", "mock-key")
-    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-20b")
+def configured_gemini_key(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
 
-def mock_completion(content, status=200):
-    return httpx.MockTransport(
-        lambda request: httpx.Response(
-            status,
-            json={"choices": [{"message": {"content": content}}]}
-            if status < 400
-            else {"error": {"code": "test_error", "message": "mock provider error"}},
-            request=request,
-        )
-    )
+class FakeGeminiClient:
+    def __init__(self, response=None, error=None, captured=None):
+        self.captured = captured if captured is not None else {}
+        self.response = response
+        self.error = error
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self.generate_content))
+        self.aio.aclose = AsyncMock()
+        self.close = lambda: None
+
+    async def generate_content(self, **kwargs):
+        self.captured["request"] = kwargs
+        if self.error:
+            raise self.error
+        return SimpleNamespace(text=self.response)
+
+
+def make_agent(response=None, error=None, captured=None):
+    captured = captured if captured is not None else {}
+    clients = []
+
+    def factory(api_key):
+        captured["api_key_received"] = api_key
+        c = FakeGeminiClient(response=response, error=error, captured=captured)
+        clients.append(c)
+        return c
+
+    return IdeaExtractionAgent(client_factory=factory), captured, clients
 
 
 @pytest.mark.asyncio
 async def test_extraction_rejects_missing_api_key(monkeypatch):
-    monkeypatch.delenv("LLM_API_KEY")
-    with pytest.raises(ServiceError, match="LLM_API_KEY"):
+    monkeypatch.delenv("GEMINI_API_KEY")
+    with pytest.raises(ServiceError, match="GEMINI_API_KEY"):
         await IdeaExtractionAgent().extract(StartupIdea(**IDEA_INPUT))
 
 
 @pytest.mark.asyncio
 async def test_extraction_accepts_valid_structured_json_and_excludes_budget_from_prompt():
-    def handler(request):
-        body = json.loads(request.content)
-        prompt = body["messages"][1]["content"]
-        assert body["response_format"] == {"type": "json_object"}
-        assert "50000" not in prompt
-        assert "estimated_budget" not in prompt
-        assert "estimated_budget_currency" not in prompt
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps(VALID_RESPONSE)}}]},
-            request=request,
-        )
+    captured = {}
+    agent, captured, clients = make_agent(json.dumps(VALID_RESPONSE), captured=captured)
 
-    result = await IdeaExtractionAgent(transport=httpx.MockTransport(handler)).extract(
-        StartupIdea(**IDEA_INPUT)
-    )
+    result = await agent.extract(StartupIdea(**IDEA_INPUT))
+
     assert result.industry == "Education"
     assert result.target_customers == ["Students"]
+    assert captured["api_key_received"] == "mock-gemini-key"
+
+    req = captured["request"]
+    assert req["model"] == GEMINI_MODEL
+    assert req["config"]["response_mime_type"] == "application/json"
+    assert req["config"]["system_instruction"]
+    prompt = req["contents"]
+    assert "50000" not in prompt
+    assert "estimated_budget" not in prompt
+    assert "estimated_budget_currency" not in prompt
+    clients[0].aio.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_extraction_accepts_markdown_fenced_json():
     content = "```json\n" + json.dumps(VALID_RESPONSE) + "\n```"
-    result = await IdeaExtractionAgent(transport=mock_completion(content)).extract(
-        StartupIdea(**IDEA_INPUT)
-    )
+    agent, _, _ = make_agent(content)
+    result = await agent.extract(StartupIdea(**IDEA_INPUT))
     assert result.proposed_solution == "Adaptive study planner"
 
 
 @pytest.mark.asyncio
 async def test_extraction_reports_invalid_json():
+    agent, _, _ = make_agent("not json")
     with pytest.raises(ServiceError, match="invalid JSON"):
-        await IdeaExtractionAgent(transport=mock_completion("not json")).extract(
-            StartupIdea(**IDEA_INPUT)
-        )
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+
+
+@pytest.mark.asyncio
+async def test_extraction_empty_response_is_rejected():
+    agent, _, _ = make_agent("")
+    with pytest.raises(ServiceError, match="empty response"):
+        await agent.extract(StartupIdea(**IDEA_INPUT))
 
 
 @pytest.mark.asyncio
@@ -104,9 +133,8 @@ async def test_extraction_allows_unknown_optional_values_when_disclosed():
             "value_proposition not specified",
         ],
     }
-    result = await IdeaExtractionAgent(
-        transport=mock_completion(json.dumps(payload))
-    ).extract(StartupIdea(**IDEA_INPUT))
+    agent, _, _ = make_agent(json.dumps(payload))
+    result = await agent.extract(StartupIdea(**IDEA_INPUT))
     assert result.proposed_solution is None
     assert result.key_features == []
 
@@ -120,40 +148,78 @@ async def test_extraction_allows_unknown_optional_values_when_disclosed():
     ],
 )
 async def test_extraction_rejects_wrong_type_and_missing_required_key(payload):
+    agent, _, _ = make_agent(json.dumps(payload))
     with pytest.raises(ServiceError, match="required idea fields"):
-        await IdeaExtractionAgent(
-            transport=mock_completion(json.dumps(payload))
-        ).extract(StartupIdea(**IDEA_INPUT))
+        await agent.extract(StartupIdea(**IDEA_INPUT))
 
 
 @pytest.mark.asyncio
-async def test_extraction_distinguishes_quota_from_rate_limit(monkeypatch):
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            429,
-            json={"error": {"code": "credit_balance_exhausted", "type": "insufficient_quota"}},
-            request=request,
-        )
-    )
-    with pytest.raises(ServiceError, match="billing limit"):
-        await IdeaExtractionAgent(transport=transport).extract(StartupIdea(**IDEA_INPUT))
+async def test_extraction_timeout_returns_504():
+    agent, _, _ = make_agent(error=asyncio.TimeoutError())
+    with pytest.raises(ServiceError, match="timed out") as exc:
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+    assert exc.value.status_code == 504
 
 
+@pytest.mark.asyncio
+async def test_extraction_httpx_timeout_returns_504():
+    agent, _, _ = make_agent(error=httpx.ReadTimeout("timeout"))
+    with pytest.raises(ServiceError, match="timed out") as exc:
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+    assert exc.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_extraction_connection_failure_returns_502():
+    agent, _, _ = make_agent(error=httpx.ConnectError("offline"))
+    with pytest.raises(ServiceError, match="Could not connect") as exc:
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+    assert exc.value.status_code == 502
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status,payload,expected",
+    "status,expected,status_code",
     [
-        (401, {"error": {"code": "invalid_api_key"}}, "rejected the API credential"),
-        (400, {"error": {"code": "model_not_found", "message": "model not found"}}, "model is invalid or unavailable"),
-        (429, {"error": {"code": "rate_limit_exceeded", "type": "rate_limit_error"}}, "rate limit reached"),
+        (401, "configured API credential", 503),
+        (403, "denied access", 503),
+        (429, "rate or quota limit", 503),
+        (400, "HTTP 400", 502),
+        (500, "provider request failed", 502),
     ],
 )
+async def test_extraction_provider_errors_are_distinguished(status, expected, status_code, caplog):
+    error = RuntimeError("sensitive provider message mock-gemini-key")
+    error.code = status
+    error.message = "sensitive provider message mock-gemini-key"
+    agent, _, _ = make_agent(error=error)
+    caplog.set_level(logging.WARNING, logger="app.services.idea_extraction")
+
+    with pytest.raises(ServiceError, match=expected) as raised:
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+
+    assert raised.value.status_code == status_code
+    assert "mock-gemini-key" not in caplog.text
+
+
 @pytest.mark.asyncio
-async def test_extraction_provider_errors_are_distinguished(status, payload, expected):
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(status, json=payload, request=request)
-    )
-    with pytest.raises(ServiceError, match=expected):
-        await IdeaExtractionAgent(transport=transport).extract(StartupIdea(**IDEA_INPUT))
+async def test_extraction_aclose_called_after_success():
+    captured = {}
+    agent, captured, clients = make_agent(json.dumps(VALID_RESPONSE), captured=captured)
+    await agent.extract(StartupIdea(**IDEA_INPUT))
+    clients[0].aio.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_extraction_aclose_called_after_error():
+    error = RuntimeError("provider failure")
+    error.code = 500
+    error.message = "provider failure"
+    captured = {}
+    agent, captured, clients = make_agent(error=error, captured=captured)
+    with pytest.raises(ServiceError):
+        await agent.extract(StartupIdea(**IDEA_INPUT))
+    clients[0].aio.aclose.assert_awaited_once()
 
 
 def test_structured_idea_requires_disclosure_of_missing_values():

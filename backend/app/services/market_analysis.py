@@ -1,5 +1,7 @@
 """Evidence-grounded market opportunity and customer segmentation analysis."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -8,76 +10,33 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 from pydantic import ValidationError
 
 from app.schemas import MarketOpportunityAnalysis, Source, StructuredIdea
-from app.services.idea_extraction import ServiceError, _trust_env
+from app.services.provider_runner import (
+    DEFAULT_GROQ_MODEL,
+    GEMINI_MODEL,
+    ServiceError,
+    _create_gemini_client,
+    _safe_gemini_error_message,
+    _safe_gemini_request_id,
+    _text_values,
+    _trust_env,
+    execute_with_fallback,
+)
 
 logger = logging.getLogger(__name__)
 MARKET_RESEARCH_CATEGORIES = ("market_information", "industry_trends")
-GEMINI_MODEL = "gemini-3.8-flash"
-
-
-def _text_values(value) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        return [text for item in value.values() for text in _text_values(item)]
-    if isinstance(value, (list, tuple)):
-        return [text for item in value for text in _text_values(item)]
-    return []
-
-
-def _safe_gemini_error_message(exc, api_key: str, sensitive_values: list[str]) -> str:
-    """Return bounded provider diagnostics with known secrets and prompt data removed."""
-    message = getattr(exc, "message", None)
-    if not isinstance(message, str) or not message.strip():
-        return "provider did not include an error message"
-    if api_key:
-        message = message.replace(api_key, "[REDACTED]")
-    for value in sensitive_values:
-        if value and len(value) >= 4:
-            message = message.replace(value, "[REDACTED]")
-    message = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", message)
-    message = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]", message)
-    message = re.sub(
-        r"(?i)(api[_ -]?key|token|secret|authorization)\s*[:=]\s*[^,;\s]+",
-        r"\1=[REDACTED]",
-        message,
-    )
-    message = re.sub(r"https?://\S+", "[REDACTED_URL]", message)
-    return " ".join(message.split())[:400] or "provider did not include an error message"
-
-
-def _safe_gemini_request_id(exc) -> str | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", {})
-    for header in ("x-goog-request-id", "x-request-id", "request-id"):
-        value = headers.get(header) if hasattr(headers, "get") else None
-        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:/+-]{1,120}", value.strip()):
-            return value.strip()
-    return None
-
-
-def _create_gemini_client(api_key: str):
-    """Create the official Google Gen AI client, honoring the project's proxy setting."""
-    from google import genai
-
-    return genai.Client(
-        api_key=api_key,
-        http_options=genai.types.HttpOptions(
-            async_client_args={"trust_env": _trust_env()},
-        ),
-    )
 
 
 def _gemini_response_schema() -> dict:
     """Adapt the existing Pydantic schema to Gemini Developer API's schema subset."""
     schema = MarketOpportunityAnalysis.model_json_schema()
 
-    def remove_unsupported_properties(value):
+    def remove_unsupported_properties(value: Any):
         if isinstance(value, dict):
             value.pop("additionalProperties", None)
             for nested in value.values():
@@ -96,62 +55,24 @@ def _unknown_analysis() -> MarketOpportunityAnalysis:
 
 
 class MarketOpportunityAnalysisAgent:
-    def __init__(self, client_factory=None):
+    def __init__(self, client_factory=None, transport=None):
         self.client_factory = client_factory or _create_gemini_client
+        self.transport = transport
 
-    async def analyze(
+    async def _analyze_gemini(
         self,
         idea: StructuredIdea,
-        research: dict[str, list[Source]],
+        sources: list[Source],
+        prompt: str,
+        system_prompt: str,
+        source_data: list[dict[str, str]],
+        allowed_urls: list[str],
     ) -> MarketOpportunityAnalysis:
-        # Competitor alternatives are passed to their dedicated downstream agent.
-        # Market demand and trend claims use their corresponding Tavily categories.
-        sources = [
-            source
-            for category in MARKET_RESEARCH_CATEGORIES
-            for source in research.get(category, [])
-        ]
-        if not sources:
-            return _unknown_analysis()
-
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ServiceError("GEMINI_API_KEY is not configured.", 503)
-        source_data = [
-            {"title": source.title, "url": source.url, "content": source.content}
-            for source in sources
-        ]
-        allowed_urls = sorted({source.url for source in sources})
-        if not allowed_urls:
-            return _unknown_analysis()
 
-        prompt = f"""Analyze market demand and customer segments for this startup using only the supplied research.
-
-Startup idea:
-{idea.model_dump_json()}
-
-Research sources:
-{json.dumps(source_data, ensure_ascii=False)}
-
-Return one valid JSON object only: no Markdown, comments, preamble, or trailing text.
-The object must have exactly these keys:
-- demand_assessment: one claim object
-- customer_segments: array of objects with segment (claim object) and needs (array of claim objects)
-- opportunities: array of claim objects
-- challenges: array of claim objects
-
-Each claim object must have exactly:
-- claim: a non-empty string; use exactly "Unknown" if unsupported
-- classification: exactly "evidence_based", "hypothesis", or "unknown"
-- evidence: an array containing only exact URLs from the supplied research
-
-An evidence_based claim must cite at least one supplied URL. A hypothesis may have no URLs, and must be clearly framed as something to validate rather than a fact. For unknown details use claim "Unknown", classification "unknown", and evidence []. Do not infer customer demographics, needs, demand, or market size from outside the supplied idea and sources. Do not invent statistics, sources, publication dates, customer data, or factual claims. Do not include or reinterpret the submitted budget. If evidence is insufficient, state Unknown or return empty lists.
-"""
-
-        system_prompt = (
-            "Return exactly one valid JSON object matching the requested schema. "
-            "Use only supplied evidence, never invent claims or URLs."
-        )
+        gemini_model = os.getenv("GEMINI_MODEL", GEMINI_MODEL)
         prompt_chars = len(prompt)
         system_chars = len(system_prompt)
         rough_input_tokens = math.ceil((prompt_chars + system_chars) / 4)
@@ -159,7 +80,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             "Gemini market analysis request metadata: model=%s source_count=%d "
             "source_content_chars=%d max_source_content_chars=%d system_prompt_chars=%d "
             "user_prompt_chars=%d rough_input_tokens=%d max_completion_tokens=provider_default",
-            GEMINI_MODEL,
+            gemini_model,
             len(sources),
             sum(len(source.content) for source in sources),
             max((len(source.content) for source in sources), default=0),
@@ -174,7 +95,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
         request_started = time.monotonic()
         logger.info(
             "Gemini market analysis request started: model=%s request_started_utc=%s",
-            GEMINI_MODEL,
+            gemini_model,
             request_started_utc,
         )
         try:
@@ -182,19 +103,18 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             async_client = client.aio
             response = await asyncio.wait_for(
                 async_client.models.generate_content(
-                    model=GEMINI_MODEL,
+                    model=gemini_model,
                     contents=prompt,
                     config={
                         "system_instruction": system_prompt,
                         "response_mime_type": "application/json",
-                        "response_schema": _gemini_response_schema(),
                     },
                 ),
-                timeout=30.0,
+                timeout=25.0,
             )
             logger.info(
                 "Gemini market analysis response received: model=%s elapsed_seconds=%.3f",
-                GEMINI_MODEL,
+                gemini_model,
                 time.monotonic() - request_started,
             )
             content = response.text
@@ -209,7 +129,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             logger.warning(
                 "Gemini market analysis request timed out: model=%s elapsed_seconds=%.3f "
                 "exception_type=%s provider_http_status=unavailable",
-                GEMINI_MODEL,
+                gemini_model,
                 time.monotonic() - request_started,
                 type(exc).__name__,
             )
@@ -218,7 +138,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             logger.warning(
                 "Gemini market analysis request timed out: model=%s elapsed_seconds=%.3f "
                 "exception_type=%s provider_http_status=unavailable",
-                GEMINI_MODEL,
+                gemini_model,
                 time.monotonic() - request_started,
                 type(exc).__name__,
             )
@@ -227,7 +147,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
             logger.warning(
                 "Gemini market analysis connection failed: model=%s elapsed_seconds=%.3f "
                 "exception_type=%s provider_http_status=unavailable",
-                GEMINI_MODEL,
+                gemini_model,
                 time.monotonic() - request_started,
                 type(exc).__name__,
             )
@@ -273,7 +193,7 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
                 type(exc).__name__,
                 request_id or "unavailable",
                 time.monotonic() - request_started,
-                GEMINI_MODEL,
+                gemini_model,
                 safe_message,
             )
             if status == 401:
@@ -305,3 +225,75 @@ An evidence_based claim must cite at least one supplied URL. A hypothesis may ha
                         close_sync()
                     except Exception:
                         logger.debug("Gemini client close failed")
+
+    async def analyze(
+        self,
+        idea: StructuredIdea,
+        research: dict[str, list[Source]],
+    ) -> MarketOpportunityAnalysis:
+        sources = [
+            source
+            for category in MARKET_RESEARCH_CATEGORIES
+            for source in research.get(category, [])
+        ]
+        if not sources:
+            return _unknown_analysis()
+
+        allowed_urls = sorted({source.url for source in sources})
+        if not allowed_urls:
+            return _unknown_analysis()
+
+        source_data = [
+            {"title": source.title, "url": source.url, "content": source.content}
+            for source in sources
+        ]
+
+        system_prompt = (
+            "Return exactly one valid JSON object matching the requested schema. "
+            "Use only supplied evidence, never invent claims or URLs."
+        )
+        prompt = f"""Analyze market demand and customer segments for this startup using only the supplied research.
+
+Startup idea:
+{idea.model_dump_json()}
+
+Research sources:
+{json.dumps(source_data, ensure_ascii=False)}
+
+Return one valid JSON object only: no Markdown, comments, preamble, or trailing text.
+The object must have exactly these keys:
+- demand_assessment: one claim object
+- customer_segments: array of objects with segment (claim object) and needs (array of claim objects)
+- opportunities: array of claim objects
+- challenges: array of claim objects
+
+Each claim object must have exactly:
+- claim: a non-empty string; use exactly "Unknown" if unsupported
+- classification: exactly "evidence_based", "hypothesis", or "unknown"
+- evidence: an array containing only exact URLs from the supplied research
+
+An evidence_based claim must cite at least one supplied URL. A hypothesis may have no URLs, and must be clearly framed as something to validate rather than a fact. For unknown details use claim "Unknown", classification "unknown", and evidence []. Do not infer customer demographics, needs, demand, or market size from outside the supplied idea and sources. Do not invent statistics, sources, publication dates, customer data, or factual claims. Do not include or reinterpret the submitted budget. If evidence is insufficient, state Unknown or return empty lists.
+"""
+
+        return await execute_with_fallback(
+            agent_name="market analysis",
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            validator=MarketOpportunityAnalysis.model_validate,
+            validation_context={"allowed_urls": allowed_urls},
+            gemini_caller=lambda: self._analyze_gemini(
+                idea, sources, prompt, system_prompt, source_data, allowed_urls
+            ),
+            transport=self.transport,
+            groq_response_format={"type": "json_object"},
+            sensitive_values=[
+                prompt,
+                system_prompt,
+                *_text_values(source_data),
+                *_text_values(
+                    idea.model_dump(
+                        exclude={"estimated_budget", "estimated_budget_currency"}
+                    )
+                ),
+            ],
+        )

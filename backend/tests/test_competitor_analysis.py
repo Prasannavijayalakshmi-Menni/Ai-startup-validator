@@ -1,5 +1,8 @@
+import asyncio
 import json
-import os
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -17,6 +20,7 @@ from app.schemas import (
 )
 from app.services.competitor_analysis import CompetitorAnalysisAgent
 from app.services.idea_extraction import IdeaExtractionAgent, ServiceError
+from app.services.market_analysis import GEMINI_MODEL
 from app.services.market_research import MarketResearchAgent
 from app.services.orchestration import ValidationReportService
 from main import app
@@ -88,6 +92,7 @@ def valid_payload():
                 "competitor_type": "direct",
                 "offering": "Study schedule planning",
                 "target_customers": "College students",
+                "pricing": "Unknown",
                 "strengths": ["Provides study schedules"],
                 "limitations": [],
                 "evidence": [SOURCE_URL],
@@ -97,7 +102,7 @@ def valid_payload():
                 "competitor_type": "unknown",
                 "offering": "Unknown",
                 "target_customers": "Unknown",
-                "pricing": None,
+                "pricing": "Unknown",
                 "strengths": [],
                 "limitations": [],
                 "evidence": [SOURCE_URL],
@@ -124,211 +129,47 @@ def valid_payload():
     }
 
 
+class FakeGeminiClient:
+    def __init__(self, response=None, error=None, captured=None):
+        self.captured = captured if captured is not None else {}
+        self.response = response
+        self.error = error
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self.generate_content))
+        self.aio.aclose = AsyncMock()
+        self.close = lambda: None
+
+    async def generate_content(self, **kwargs):
+        self.captured["request"] = kwargs
+        if self.error:
+            raise self.error
+        return SimpleNamespace(text=self.response)
+
+
 @pytest.fixture(autouse=True)
 def configured_mock_credentials(monkeypatch):
-    monkeypatch.setenv("LLM_API_KEY", "mock-llm-key")
-    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-20b")
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
 
-def response_transport(payload, status=200):
-    return httpx.MockTransport(
-        lambda request: httpx.Response(
-            status,
-            json=payload,
-            request=request,
-        )
-    )
+def make_agent(response=None, error=None, captured=None):
+    captured = captured if captured is not None else {}
+    clients = []
+
+    def factory(api_key):
+        captured["api_key_received"] = api_key
+        c = FakeGeminiClient(response=response, error=error, captured=captured)
+        clients.append(c)
+        return c
+
+    return CompetitorAnalysisAgent(client_factory=factory), captured, clients
 
 
 @pytest.mark.asyncio
 async def test_competitor_agent_returns_typed_multi_competitor_result_and_unknown_pricing():
-    calls = []
+    captured = {}
+    agent, captured, clients = make_agent(json.dumps(valid_payload()), captured=captured)
 
-    def handler(request):
-        assert request.method == "POST"
-        configured_base_url = os.getenv(
-            "LLM_BASE_URL", "https://api.groq.com/openai/v1"
-        ).rstrip("/")
-        assert str(request.url) == f"{configured_base_url}/chat/completions"
-        assert request.headers["Authorization"] == "Bearer mock-llm-key"
-        body = json.loads(request.content)
-        assert set(body) == {
-            "model", "temperature", "response_format", "messages"
-        }
-        assert body["model"] == "openai/gpt-oss-20b"
-        assert body["temperature"] == 0
-        expected_schema = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "competitor_analysis",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "competitors": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "competitor_type": {
-                                        "type": "string",
-                                        "enum": ["direct", "indirect", "unknown"],
-                                    },
-                                    "offering": {"type": "string"},
-                                    "target_customers": {"type": "string"},
-                                    "pricing": {"type": "string"},
-                                    "strengths": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "limitations": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "evidence": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "enum": [SOURCE_URL],
-                                        },
-                                    },
-                                },
-                                "required": [
-                                    "name", "competitor_type", "offering", "target_customers", "pricing",
-                                    "strengths", "limitations", "evidence",
-                                ],
-                                "additionalProperties": False,
-                            },
-                        },
-                        "market_gaps": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "description": {"type": "string"},
-                                    "rationale": {"type": "string"},
-                                    "gap_type": {
-                                        "type": "string",
-                                        "enum": ["evidence_based", "hypothesis"],
-                                    },
-                                    "evidence": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "enum": [SOURCE_URL],
-                                        },
-                                    },
-                                },
-                                "required": [
-                                    "description", "rationale", "gap_type", "evidence"
-                                ],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
-                    "required": ["competitors", "market_gaps"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-        assert body["response_format"] == expected_schema
-
-        expected_system = (
-            "Return exactly one valid JSON object and nothing else. "
-            "Do not use Markdown fences or surrounding text. "
-            "Never fabricate facts or source URLs."
-        )
-        expected_research = json.dumps(
-            [{"title": source.title, "url": source.url, "content": source.content}
-             for source in SOURCES],
-            ensure_ascii=False,
-        )
-        expected_market_analysis = json.dumps(
-            MARKET_ANALYSIS.model_dump(mode="json"), ensure_ascii=False
-        )
-        expected_prompt = f"""
-Analyze the startup idea and the supplied competitor research.
-
-Startup idea:
-{IDEA.model_dump_json()}
-
-Market opportunity and customer analysis:
-{expected_market_analysis}
-
-Research sources:
-{expected_research}
-
-Return exactly one syntactically valid JSON object. Do not include Markdown
-fences, comments, a preamble, or any text before or after the JSON object. Use
-double quotes for every JSON key and string; do not use trailing commas.
-
-The object must have exactly these top-level keys and value types:
-- "competitors": array of competitor objects
-- "market_gaps": array of market gap objects
-
-Every competitor object must have exactly these keys and types:
-- "name": non-empty string
-- "competitor_type": exactly "direct", "indirect", or "unknown"
-- "offering": string; use "Unknown" when unsupported
-- "target_customers": string; use "Unknown" when unsupported
-- "pricing": string; use exactly "Unknown" when pricing is unsupported
-- "strengths": array of strings (use [] when unsupported)
-- "limitations": array of strings (use [] when unsupported)
-- "evidence": array of source URL strings, with at least one supplied URL
-
-Every market gap object must have exactly these keys and types:
-- "description": non-empty string
-- "rationale": non-empty string
-- "gap_type": exactly "evidence_based" or "hypothesis"
-- "evidence": array of supplied source URL strings; use [] when the gap is a
-  hypothesis without direct supporting evidence. An "evidence_based" gap must
-  have at least one evidence URL.
-
-All list fields must be JSON arrays, including empty lists. Do not omit fields
-or add keys. If no entries are supported, return this valid empty result:
-{{"competitors":[],"market_gaps":[]}}
-
-Rules:
-- Use only the supplied sources, startup idea, and market analysis.
-- Use the market analysis to compare competitor relevance to its identified customer segments, needs, and opportunities. Treat market-analysis hypotheses as hypotheses, not evidence.
-- Classify a competitor as direct only when the supplied evidence supports a similar offering for substantially the same customer need. Classify it as indirect when the evidence supports an alternative approach to the same or a related need. Use "unknown" when the research does not support either classification.
-- Never invent competitor names, prices, features, or citations.
-- If pricing is not supported by a source, use "Unknown".
-- Every evidence URL must exactly match a supplied source URL.
-- Distinguish verified source information from your own hypotheses.
-- A potential gap is not proof that no competitor offers that feature.
-- If evidence is insufficient, return empty lists rather than inventing claims.
-- Do not include the submitted budget in this analysis.
-"""
-        assert expected_research in expected_prompt
-        expected_messages = [
-            {"role": "system", "content": expected_system},
-            {"role": "user", "content": expected_prompt},
-        ]
-        assert body["messages"] == expected_messages
-        prompt = body["messages"][1]["content"]
-        calls.append(prompt)
-        assert SOURCE_URL in prompt
-        assert "50000" not in prompt
-        assert "estimated_budget" not in prompt
-        assert "College students" in prompt
-        assert "exactly one syntactically valid JSON object" in prompt
-        assert "Do not include Markdown" in prompt
-        assert '"strengths": array of strings' in prompt
-        assert '"limitations": array of strings' in prompt
-        assert '"gap_type": exactly "evidence_based" or "hypothesis"' in prompt
-        assert '"pricing": string; use exactly "Unknown"' in prompt
-        assert '"competitors":[],"market_gaps":[]' in prompt
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps(valid_payload())}}]},
-            request=request,
-        )
-
-    result = await CompetitorAnalysisAgent(
-        transport=httpx.MockTransport(handler)
-    ).analyze(IDEA, RESEARCH, MARKET_ANALYSIS)
+    result = await agent.analyze(IDEA, RESEARCH, MARKET_ANALYSIS)
 
     assert isinstance(result, CompetitorAnalysis)
     assert len(result.competitors) == 3
@@ -338,15 +179,33 @@ Rules:
     assert result.competitors[1].competitor_type == "unknown"
     assert result.competitors[2].competitor_type == "indirect"
     assert result.market_gaps[0].gap_type == "hypothesis"
-    assert len(calls) == 1
+
+    assert captured["api_key_received"] == "mock-gemini-key"
+    req = captured["request"]
+    assert req["model"] == GEMINI_MODEL == "gemini-3.8-flash"
+    assert req["config"]["response_mime_type"] == "application/json"
+    assert req["config"]["system_instruction"]
+    prompt = req["contents"]
+    assert SOURCE_URL in prompt
+    assert "50000" not in prompt
+    assert "estimated_budget" not in prompt
+    assert "College students" in prompt
+    assert "exactly one syntactically valid JSON object" in prompt
+    assert '"pricing": string; use exactly "Unknown"' in prompt
+    assert '"competitors":[],"market_gaps":[]' in prompt
+    clients[0].aio.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_empty_competitor_sources_returns_empty_without_llm_request():
+async def test_empty_competitor_sources_returns_empty_without_gemini_call(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     calls = []
-    agent = CompetitorAnalysisAgent(
-        transport=httpx.MockTransport(lambda request: calls.append(request))
-    )
+
+    def factory(api_key):
+        calls.append(api_key)
+        raise AssertionError("unexpected Gemini call")
+
+    agent = CompetitorAnalysisAgent(client_factory=factory)
     result = await agent.analyze(IDEA, {"competitors_and_alternatives": []})
     assert result.competitors == []
     assert result.market_gaps == []
@@ -356,37 +215,34 @@ async def test_empty_competitor_sources_returns_empty_without_llm_request():
 @pytest.mark.asyncio
 async def test_missing_market_analysis_is_passed_as_unknown_context():
     captured = {}
+    agent, captured, _ = make_agent(json.dumps({"competitors": [], "market_gaps": []}), captured=captured)
 
-    def handler(request):
-        captured["prompt"] = json.loads(request.content)["messages"][1]["content"]
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps({"competitors": [], "market_gaps": []})}}]},
-            request=request,
-        )
-
-    result = await CompetitorAnalysisAgent(
-        transport=httpx.MockTransport(handler)
-    ).analyze(IDEA, RESEARCH)
+    result = await agent.analyze(IDEA, RESEARCH)
     assert result.competitors == []
-    assert '"claim": "Unknown"' in captured["prompt"]
-    assert '"customer_segments": []' in captured["prompt"]
+    prompt = captured["request"]["contents"]
+    assert '"claim": "Unknown"' in prompt
+    assert '"customer_segments": []' in prompt
 
 
 @pytest.mark.asyncio
-async def test_missing_llm_configuration_is_clear(monkeypatch):
-    monkeypatch.delenv("LLM_API_KEY")
-    with pytest.raises(ServiceError, match="LLM_API_KEY"):
+async def test_missing_gemini_key_is_reported(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(ServiceError, match="GEMINI_API_KEY"):
         await CompetitorAnalysisAgent().analyze(IDEA, RESEARCH)
 
 
 @pytest.mark.asyncio
 async def test_malformed_json_is_rejected():
-    transport = response_transport(
-        {"choices": [{"message": {"content": "not json"}}]}
-    )
-    with pytest.raises(ServiceError, match="invalid competitor analysis"):
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
+    agent, _, _ = make_agent("not json")
+    with pytest.raises(ServiceError, match="invalid competitor analysis JSON"):
+        await agent.analyze(IDEA, RESEARCH)
+
+
+@pytest.mark.asyncio
+async def test_empty_response_is_rejected():
+    agent, _, _ = make_agent("")
+    with pytest.raises(ServiceError, match="empty competitor analysis"):
+        await agent.analyze(IDEA, RESEARCH)
 
 
 @pytest.mark.asyncio
@@ -401,11 +257,9 @@ async def test_malformed_json_is_rejected():
     ],
 )
 async def test_invalid_schema_or_unsupported_citation_rejected(payload, expected):
-    transport = response_transport(
-        {"choices": [{"message": {"content": json.dumps(payload)}}]}
-    )
+    agent, _, _ = make_agent(json.dumps(payload))
     with pytest.raises(ServiceError, match=expected):
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
+        await agent.analyze(IDEA, RESEARCH)
 
 
 def test_invalid_gap_type_and_unsupported_evidence_are_rejected_by_schema():
@@ -443,94 +297,73 @@ def test_invalid_gap_type_and_unsupported_evidence_are_rejected_by_schema():
     ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status,detail",
-    [(400, "request"), (401, "credential"), (429, "rate limit")],
-)
-@pytest.mark.asyncio
-async def test_provider_http_errors_are_categorized(status, detail):
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(status, json={"error": "mock error"}, request=request)
-    )
-    with pytest.raises(ServiceError, match=detail):
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
-
-
-@pytest.mark.asyncio
-async def test_http_400_logs_structured_provider_reason_without_credentials(caplog):
-    provider_reason = (
-        "response_format is unsupported; Bearer mock-llm-key gsk_abc123 token=secret-value"
-    )
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            400,
-            json={
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "unsupported_parameter",
-                    "message": provider_reason,
-                }
-            },
-            request=request,
-        )
-    )
-    caplog.set_level("WARNING", logger="app.services.competitor_analysis")
-
-    with pytest.raises(ServiceError, match="rejected the competitor analysis request"):
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
-
-    assert "unsupported_parameter" in caplog.text
-    assert "response_format is unsupported" in caplog.text
-    assert "mock-llm-key" not in caplog.text
-    assert "gsk_abc123" not in caplog.text
-    assert "secret-value" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_json_validation_error_logs_only_failed_generation_diagnosis(caplog):
-    rejected_output = '{"competitors": [oops]}'
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            400,
-            json={
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "json_validate_failed",
-                    "message": "Failed to validate JSON. Please adjust your prompt.",
-                    "failed_generation": rejected_output,
-                }
-            },
-            request=request,
-        )
-    )
-    caplog.set_level("WARNING", logger="app.services.competitor_analysis")
-
-    with pytest.raises(ServiceError, match="rejected the competitor analysis request") as exc:
-        await CompetitorAnalysisAgent(transport=transport).analyze(IDEA, RESEARCH)
-
-    assert exc.value.status_code == 502
-    assert "json_validate_failed" in caplog.text
-    assert "failed_generation_diagnosis=invalid_json line=1" in caplog.text
-    assert rejected_output not in caplog.text
-
-
-@pytest.mark.parametrize(
-    "error_type,expected,status",
+    "status,expected,status_code",
     [
-        (httpx.ReadTimeout, "timed out", 504),
-        (httpx.ConnectError, "Could not connect", 502),
+        (400, "HTTP 400", 502),
+        (401, "credential", 503),
+        (403, "denied", 503),
+        (429, "rate or quota", 503),
+        (500, "provider request failed", 502),
     ],
 )
-@pytest.mark.asyncio
-async def test_provider_timeout_and_connection_failures(error_type, expected, status):
-    def handler(request):
-        raise error_type("mock provider failure", request=request)
+async def test_gemini_api_errors_are_sanitized_and_mapped(status, expected, status_code, caplog):
+    error = RuntimeError("sensitive provider message mock-gemini-key")
+    error.code = status
+    error.message = "sensitive provider message mock-gemini-key"
+    agent, _, _ = make_agent(error=error)
+    caplog.set_level(logging.WARNING, logger="app.services.competitor_analysis")
 
-    with pytest.raises(ServiceError, match=expected) as exc:
-        await CompetitorAnalysisAgent(
-            transport=httpx.MockTransport(handler)
-        ).analyze(IDEA, RESEARCH)
-    assert exc.value.status_code == status
+    with pytest.raises(ServiceError, match=expected) as raised:
+        await agent.analyze(IDEA, RESEARCH)
+
+    assert raised.value.status_code == status_code
+    assert "mock-gemini-key" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_gemini_timeout_returns_504():
+    agent, _, _ = make_agent(error=asyncio.TimeoutError())
+    with pytest.raises(ServiceError, match="timed out") as exc:
+        await agent.analyze(IDEA, RESEARCH)
+    assert exc.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_gemini_connection_failure_returns_502():
+    agent, _, _ = make_agent(error=httpx.ConnectError("offline"))
+    with pytest.raises(ServiceError, match="Could not connect") as exc:
+        await agent.analyze(IDEA, RESEARCH)
+    assert exc.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_gemini_httpx_timeout_returns_504():
+    agent, _, _ = make_agent(error=httpx.ReadTimeout("timeout"))
+    with pytest.raises(ServiceError, match="timed out") as exc:
+        await agent.analyze(IDEA, RESEARCH)
+    assert exc.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_called_after_success():
+    captured = {}
+    agent, captured, clients = make_agent(json.dumps(valid_payload()), captured=captured)
+    await agent.analyze(IDEA, RESEARCH)
+    clients[0].aio.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_called_after_error():
+    captured = {}
+    error = RuntimeError("provider failure")
+    error.code = 500
+    error.message = "provider failure"
+    agent, captured, clients = make_agent(error=error, captured=captured)
+    with pytest.raises(ServiceError):
+        await agent.analyze(IDEA, RESEARCH)
+    clients[0].aio.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -556,36 +389,46 @@ async def test_tavily_timeout_and_connection_failures_remain_distinct(monkeypatc
 async def test_orchestration_calls_agents_in_order_and_preserves_data(monkeypatch):
     order = []
     monkeypatch.setenv("LLM_API_KEY", "mock-only")
-    def extraction_handler(request):
-        prompt = json.loads(request.content)["messages"][1]["content"]
-        assert "50000" not in prompt
-        assert "estimated_budget" not in prompt
-        assert "estimated_budget_currency" not in prompt
-        return httpx.Response(200, json={
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "problem": IDEA.problem,
-                                "proposed_solution": IDEA.proposed_solution,
-                                "target_customers": IDEA.target_customers,
-                                "industry": IDEA.industry,
-                                "key_features": IDEA.key_features,
-                                "value_proposition": IDEA.value_proposition,
-                                "assumptions_and_missing_information": [],
-                            }
-                        )
-                    }
-                }
-            ]
-        }, request=request)
-
-    extraction_transport = httpx.MockTransport(extraction_handler)
-
     class Extractor:
         def __init__(self):
-            self.agent = IdeaExtractionAgent(transport=extraction_transport)
+            captured_extraction = {}
+
+            def factory(api_key):
+                from types import SimpleNamespace
+                from unittest.mock import AsyncMock as _AsyncMock
+
+                def make_response(content):
+                    return SimpleNamespace(text=content)
+
+                extraction_response = json.dumps(
+                    {
+                        "problem": IDEA.problem,
+                        "proposed_solution": IDEA.proposed_solution,
+                        "target_customers": IDEA.target_customers,
+                        "industry": IDEA.industry,
+                        "key_features": IDEA.key_features,
+                        "value_proposition": IDEA.value_proposition,
+                        "assumptions_and_missing_information": [],
+                    }
+                )
+
+                async def generate_content(**kwargs):
+                    prompt = kwargs.get("contents", "")
+                    assert "50000" not in prompt
+                    assert "estimated_budget" not in prompt
+                    assert "estimated_budget_currency" not in prompt
+                    return make_response(extraction_response)
+
+                client = SimpleNamespace(
+                    aio=SimpleNamespace(
+                        models=SimpleNamespace(generate_content=generate_content),
+                        aclose=_AsyncMock(),
+                    ),
+                    close=lambda: None,
+                )
+                return client
+
+            self.agent = IdeaExtractionAgent(client_factory=factory)
 
         async def extract(self, submitted):
             order.append("extract")
