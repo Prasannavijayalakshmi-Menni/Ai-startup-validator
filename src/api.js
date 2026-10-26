@@ -1,5 +1,4 @@
-const DEFAULT_API_BASE_URL = "http://127.0.0.1:8010";
-
+const DEFAULT_API_BASE_URL = "https://ai-startup-validator-oyzp.onrender.com";
 export function getApiBaseUrl(configuredUrl = import.meta.env.VITE_API_BASE_URL) {
   return (configuredUrl?.trim() || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
 }
